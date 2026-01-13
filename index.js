@@ -46,16 +46,18 @@ async function checkJMA() {
   let mention = "";
   let title = "";
 
-  // 한국 지진 판정 (JMA 데이터)
+  // 한국 지진
   if (/Korea|대한민국|South/i.test(name)) {
+    if (mag >= 4.0) mention = "@everyone";
+    else return; // 4 미만은 메시지 없음
     title = "🇰🇷 한국 지진 발생";
-    mention = mag >= 4.0 ? "@everyone" : "@here";
   }
   // 일본 지진
-  else if (/Japan|일본|Honshu|Hokkaido|Kyushu/i.test(name)) {
+  else if (/Japan|일본|Honshu|Hokkaido|Kyushu|北海道/i.test(name)) {
+    if (maxScale >= 55) mention = "@everyone"; // 5상 이상
+    else if (maxScale >= 40) mention = "@here"; // 4상 이상
+    else return; // 그 이하 무시
     title = "🇯🇵 일본 지진 발생";
-    mention = maxScale >= 55 ? "@everyone" : "";
-    if (!mention) return; // 조건 안 맞으면 메시지 없음
   } else {
     return;
   }
@@ -80,7 +82,10 @@ client.once("ready", async () => {
   // 테스트용 강제 메시지
   const channel = await client.channels.fetch(CHANNEL_ID);
   if (channel) {
-    await channel.send("🧪 테스트 메시지: 봇 정상 작동 중");
+    const testEmbed = new EmbedBuilder()
+      .setTitle("🧪 테스트 메시지")
+      .setDescription("봇 정상 작동 중");
+    await channel.send({ embeds: [testEmbed] });
   }
 
   // 30초마다 지진 체크
