@@ -46,7 +46,8 @@ async function fetchKMA() {
     if (String(r.data?.response?.header?.resultCode) !== '0') return [];
     const items = r.data.response.body.items?.item;
     return items ? (Array.isArray(items) ? items : [items]) : [];
-  } catch {
+  } catch (e) {
+    console.error('[KMA ERROR]', e.message);
     return [];
   }
 }
@@ -56,7 +57,8 @@ async function fetchJMA() {
   try {
     const r = await axios.get(JMA_URL, { timeout: 10000 });
     return r.data || [];
-  } catch {
+  } catch (e) {
+    console.error('[JMA ERROR]', e.message);
     return [];
   }
 }
@@ -66,10 +68,15 @@ async function loop() {
   if (!running) return;
   lastLoop = Date.now();
 
-  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel) return;
+  let channel;
+  try {
+    channel = await client.channels.fetch(CHANNEL_ID);
+  } catch {
+    console.error('[CHANNEL FETCH FAILED]');
+    return;
+  }
 
-  /* ---- KMA 메인 ---- */
+  /* ---- KMA ---- */
   for (const q of await fetchKMA()) {
     if (!q.eqkNo || sentKMA.has(q.eqkNo)) continue;
     sentKMA.add(q.eqkNo);
@@ -88,11 +95,15 @@ async function loop() {
       .setFooter({ text: '출처: 기상청(KMA)' })
       .setTimestamp();
 
-    await channel.send({ content: mention, embeds: [embed] });
+    try {
+      await channel.send({ content: mention, embeds: [embed] });
+    } catch (e) {
+      console.error('[DISCORD SEND ERROR]', e.message);
+    }
   }
 
-  /* ---- JMA 보조 ---- */
-  for (const q of (await fetchJMA()).slice(0,5)) {
+  /* ---- JMA ---- */
+  for (const q of (await fetchJMA()).slice(0, 5)) {
     if (!q.time || !q.lat || !q.lon) continue;
     const id = `${q.time}_${q.lat}_${q.lon}`;
     if (sentJMA.has(id)) continue;
@@ -113,13 +124,19 @@ async function loop() {
       .setFooter({ text: '출처: 일본기상청(JMA)' })
       .setTimestamp();
 
-    await channel.send({ embeds: [embed] });
+    try {
+      await channel.send({ embeds: [embed] });
+    } catch (e) {
+      console.error('[DISCORD SEND ERROR]', e.message);
+    }
   }
 }
 
 /* ===== PINGER ===== */
 if (RENDER_URL) {
-  setInterval(() => axios.get(RENDER_URL).catch(()=>{}), 60_000);
+  setInterval(() => {
+    axios.get(RENDER_URL).catch(() => {});
+  }, 60_000);
 }
 
 /* ===== SLASH COMMANDS ===== */
@@ -130,31 +147,60 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
+/* ===== READY ===== */
 client.once('ready', async () => {
-  await rest.put(Routes.applicationCommands(APPLICATION_ID), { body: commands });
+  try {
+    await rest.put(
+      Routes.applicationCommands(APPLICATION_ID),
+      { body: commands }
+    );
+  } catch (e) {
+    console.error('[COMMAND REGISTER ERROR]', e.message);
+  }
+
   setInterval(loop, 60_000);
-  console.log('지진봇 가동');
+  console.log('지진봇 정상 가동');
 });
 
+/* ===== INTERACTION ===== */
 client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
 
-  if (i.commandName === 'stop') {
-    running = false;
-    await i.reply('봇 중지됨');
-    process.exit(0);
-  }
+  try {
+    if (i.commandName === 'stop') {
+      running = false;
+      await i.reply('봇 중지됨');
+      process.exit(0);
+    }
 
-  if (i.commandName === '실시간정보') {
-    const e = new EmbedBuilder()
-      .setTitle('📡 실시간 상태')
-      .addFields(
-        { name: '상태', value: running ? '작동 중' : '중지', inline: true },
-        { name: '마지막 조회', value: lastLoop ? new Date(lastLoop).toLocaleString() : '없음', inline: true }
-      )
-      .setTimestamp();
-    await i.reply({ embeds: [e], ephemeral: true });
+    if (i.commandName === '실시간정보') {
+      const e = new EmbedBuilder()
+        .setTitle('📡 실시간 상태')
+        .addFields(
+          { name: '상태', value: running ? '작동 중' : '중지', inline: true },
+          { name: '마지막 조회', value: lastLoop ? new Date(lastLoop).toLocaleString() : '없음', inline: true }
+        )
+        .setTimestamp();
+
+      await i.reply({ embeds: [e], ephemeral: true });
+    }
+  } catch (e) {
+    console.error('[INTERACTION ERROR]', e.message);
   }
 });
 
+/* ===== SAFETY NET (핵심) ===== */
+client.on('error', err => {
+  console.error('[DISCORD ERROR]', err.message);
+});
+
+process.on('unhandledRejection', err => {
+  console.error('[UNHANDLED REJECTION]', err);
+});
+
+process.on('uncaughtException', err => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+});
+
+/* ===== LOGIN ===== */
 client.login(TOKEN);
