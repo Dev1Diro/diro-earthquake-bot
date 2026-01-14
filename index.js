@@ -15,21 +15,20 @@ const client = new Client({
 // ===== 환경변수 =====
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const TOKEN = process.env.DISCORD_TOKEN;
-const KMA_API = process.env.KMA_API_KEY; // “주소+키” 형식으로 env에 넣는 값
-const JMA_API = process.env.JMA_API_KEY; // “주소+키” 형식
+const KMA_API = process.env.KMA_API_KEY; // env: URL+Key
+const JMA_API = process.env.JMA_API_KEY; // env: URL+Key
 const PINGER_URL = process.env.PINGER_URL;
 const PORT = process.env.PORT || 3000;
 
-// ===== 내부 상태 저장 =====
+// ===== 이전 지진 기록 저장 =====
 let lastKMA = new Set();
 let lastJMA = new Set();
 
 // ===== KMA 지진 조회 =====
 async function fetchKMA() {
     try {
-        // API가 env에 “https://...eqk_now.php?authkey=실제키”처럼 들어 있음
-        const response = await axios.get(KMA_API, { timeout: 10000 });
-        return Array.isArray(response.data) ? response.data : [];
+        const res = await axios.get(KMA_API, { timeout: 10000 });
+        return Array.isArray(res.data) ? res.data : [];
     } catch (err) {
         console.error("KMA fetch error:", err.message);
         return [];
@@ -39,24 +38,23 @@ async function fetchKMA() {
 // ===== JMA 지진 조회 =====
 async function fetchJMA() {
     try {
-        // JMA_API도 env에 주소+키 형태로 들어 있음
-        const response = await axios.get(JMA_API, { timeout: 10000 });
-        return Array.isArray(response.data) ? response.data : [];
+        const res = await axios.get(JMA_API, { timeout: 10000 });
+        return Array.isArray(res.data) ? res.data : [];
     } catch (err) {
         console.error("JMA fetch error:", err.message);
         return [];
     }
 }
 
-// ===== 임베드 메시지 =====
+// ===== 임베드 메시지 전송 =====
 async function sendEmbed(channel, source, place, magnitude, time) {
     try {
         const embed = new EmbedBuilder()
             .setTitle(`${source} 지진 발생`)
             .addFields(
-                { name: '장소', value: place || '없음', inline: true },
-                { name: '규모', value: magnitude?.toString() || '없음', inline: true },
-                { name: '시간', value: time || '없음', inline: true }
+                { name: '장소', value: place || '정보 없음', inline: true },
+                { name: '규모', value: magnitude?.toString() || '정보 없음', inline: true },
+                { name: '시간', value: time || '정보 없음', inline: true }
             )
             .setFooter({
                 text: `출처: ${source === 'KMA' ? '한국기상청' : '일본기상청(JMA)'}`
@@ -74,23 +72,19 @@ async function checkQuakes(channel) {
     try {
         // KMA
         const kmaData = await fetchKMA();
-        const currentKMA = new Set(kmaData.map(e => e.index));
+        const currentK = new Set(kmaData.map(e => e.index));
         for (const e of kmaData) {
-            if (!lastKMA.has(e.index)) {
-                await sendEmbed(channel, 'KMA', e.place, e.magnitude, e.time);
-            }
+            if (!lastKMA.has(e.index)) await sendEmbed(channel, 'KMA', e.place, e.magnitude, e.time);
         }
-        lastKMA = currentKMA;
+        lastKMA = currentK;
 
         // JMA
         const jmaData = await fetchJMA();
-        const currentJMA = new Set(jmaData.map(e => e.index));
+        const currentJ = new Set(jmaData.map(e => e.index));
         for (const e of jmaData) {
-            if (!lastJMA.has(e.index)) {
-                await sendEmbed(channel, 'JMA', e.place, e.magnitude, e.time);
-            }
+            if (!lastJMA.has(e.index)) await sendEmbed(channel, 'JMA', e.place, e.magnitude, e.time);
         }
-        lastJMA = currentJMA;
+        lastJMA = currentJ;
     } catch (err) {
         console.error("checkQuakes error:", err.message);
     }
@@ -101,42 +95,37 @@ async function sendPing() {
     if (!PINGER_URL) return;
     try {
         await axios.get(PINGER_URL, { timeout: 10000 });
-        console.log("Ping OK");
+        console.log("Ping OK - 정상작동 확인");
     } catch (err) {
         console.error("Ping failed:", err.message);
     }
 }
 
-// ===== Schedule =====
+// ===== 루프 시작 =====
 function startLoop(channel) {
-    // 30초마다 지진 체크
-    setInterval(() => checkQuakes(channel), 30 * 1000);
-
-    // 1분마다 Ping
-    setInterval(sendPing, 60 * 1000);
-
-    // 시작 직후 즉시 실행
-    sendPing();
-    checkQuakes(channel);
+    setInterval(() => checkQuakes(channel), 20 * 1000); // 20초마다 지진 체크
+    setInterval(sendPing, 60 * 1000); // 1분마다 Ping + 콘솔 표시
+    sendPing();      // 시작 직후 Ping
+    checkQuakes(channel); // 시작 직후 지진 체크
 }
 
-// ===== Express 포트 바인딩 (Render 무료 플랜) =====
+// ===== Express 서버 =====
 const app = express();
 app.get('/', (req, res) => res.send('Bot Active'));
-app.listen(PORT, () => console.log(`Web on port ${PORT}`));
+app.listen(PORT, () => console.log(`Web server on port ${PORT}`));
 
 // ===== 예외 처리 =====
 process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', err => console.error('Unhandled Rejection:', err));
 
-// ===== Discord 시작 =====
+// ===== Discord 로그인 & 시작 =====
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
     try {
         const channel = await client.channels.fetch(CHANNEL_ID);
-        if (!channel) {
-            console.error("채널을 찾을 수 없습니다. ID 확인");
+        if (!channel || !channel.isTextBased()) {
+            console.error("유효한 텍스트 채널이 아님");
             return;
         }
         startLoop(channel);
