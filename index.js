@@ -4,6 +4,7 @@ require('dotenv').config();
 // ===== 즉시 검증 =====
 console.log('TOKEN 존재:', !!process.env.TOKEN);
 console.log('DISCORD_CHANNEL_ID:', process.env.DISCORD_CHANNEL_ID);
+console.log('JMA_API_KEY 존재:', !!process.env.JMA_API_KEY);
 
 // ===== 라이브러리 =====
 const axios = require('axios');
@@ -12,6 +13,7 @@ const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 // ===== 환경변수 =====
 const BOT_TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const JMA_KEY = process.env.JMA_API_KEY;
 
 // ===== Discord Client =====
 const client = new Client({
@@ -26,7 +28,7 @@ function yyyymmdd(date) {
     return date.toISOString().slice(0, 10).replace(/-/g, '');
 }
 
-// ===== KMA URL (네가 준 URL 기반, 날짜 자동) =====
+// ===== KMA URL =====
 function getKMAUrl() {
     const now = new Date();
     const from = new Date(now);
@@ -41,44 +43,54 @@ function getKMAUrl() {
         + `&dataType=JSON`;
 }
 
-// ===== KMA 지진 조회 =====
+// ===== KMA 조회 =====
 async function fetchKMA() {
     try {
-        const url = getKMAUrl();
-        const res = await axios.get(url, { timeout: 5000 });
-
+        const res = await axios.get(getKMAUrl(), { timeout: 5000 });
         const header = res.data?.response?.header;
-        if (header?.resultCode !== '0') {
+
+        if (String(header?.resultCode) !== '0') {
             console.error('KMA API 오류:', header?.resultMsg);
             return [];
         }
 
         const items = res.data.response.body.items?.item;
-        if (!items) return [];
-        return Array.isArray(items) ? items : [items];
-
+        return items ? (Array.isArray(items) ? items : [items]) : [];
     } catch (e) {
         console.error('KMA fetch 실패:', e.message);
         return [];
     }
 }
 
-// ===== 지진 체크 =====
+// ===== JMA 조회 (환경변수 사용) =====
+async function fetchJMA() {
+    try {
+        // JMA는 보통 공개 JSON 엔드포인트 + 키 헤더 방식
+        const res = await axios.get('JMA_ENDPOINT', {
+            headers: {
+                'Authorization': `Bearer ${JMA_KEY}`
+            },
+            timeout: 5000
+        });
+        return res.data || [];
+    } catch (e) {
+        console.error('JMA fetch 실패:', e.message);
+        return [];
+    }
+}
+
+// ===== 지진 체크 (현재는 KMA만 알림) =====
 async function checkEarthquake() {
     if (!running) return;
 
     const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-    if (!channel || !channel.isTextBased()) {
-        console.error('채널 fetch 실패 또는 텍스트 채널 아님');
-        return;
-    }
+    if (!channel || !channel.isTextBased()) return;
 
     const list = await fetchKMA();
     if (list.length === 0) return;
 
     const latest = list[0];
     if (latest.eqkNo === lastKMAEqkNo) return;
-
     lastKMAEqkNo = latest.eqkNo;
 
     const embed = new EmbedBuilder()
@@ -95,21 +107,20 @@ async function checkEarthquake() {
     channel.send({ embeds: [embed] });
 }
 
-// ===== 20초마다 지진 체크 =====
+// ===== 루프 =====
 function earthquakeLoop() {
     if (!running) return;
     checkEarthquake();
     setTimeout(earthquakeLoop, 20 * 1000);
 }
 
-// ===== 1분 핑 =====
 function pingLoop() {
     if (!running) return;
     console.log('PING OK', new Date().toISOString());
     setTimeout(pingLoop, 60 * 1000);
 }
 
-// ===== /stop 명령 =====
+// ===== /stop =====
 client.on('interactionCreate', async (i) => {
     if (!i.isChatInputCommand()) return;
     if (i.commandName === 'stop') {
