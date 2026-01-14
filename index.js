@@ -9,7 +9,7 @@ const {
   EmbedBuilder
 } = require('discord.js');
 
-// ===== ENV =====
+/* ================= ENV ================= */
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
@@ -19,12 +19,12 @@ if (!TOKEN || !CLIENT_ID || !CHANNEL_ID) {
   process.exit(1);
 }
 
-// ===== DISCORD =====
+/* ================= CLIENT ================= */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-// ===== 상태 =====
+/* ================= STATE ================= */
 let lastKMA = null;
 let lastJMA = null;
 let kmaFail = 0;
@@ -33,14 +33,14 @@ let lastPing = Date.now();
 let 장애알림보냄 = false;
 let running = true;
 
-// ===== 슬래시 명령 자동 등록 =====
+/* ================= SLASH COMMANDS ================= */
 const commands = [
   new SlashCommandBuilder()
     .setName('stop')
     .setDescription('봇 종료'),
   new SlashCommandBuilder()
     .setName('실시간정보')
-    .setDescription('지진봇 실시간 상태 확인')
+    .setDescription('지진봇 실시간 상태')
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -53,29 +53,31 @@ async function registerCommands() {
   console.log('슬래시 명령 등록 완료');
 }
 
-// ===== 유틸 =====
-const yyyymmdd = d => d.toISOString().slice(0,10).replace(/-/g,'');
+/* ================= UTIL ================= */
+const yyyymmdd = d => d.toISOString().slice(0, 10).replace(/-/g, '');
 
-// ===== KMA =====
+/* ================= KMA ================= */
 function kmaUrl() {
   const now = new Date();
   const from = new Date(now);
   from.setDate(from.getDate() - 3);
 
-  return `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg`
-    + `?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40`
-    + `&numOfRows=5&pageNo=1`
+  return (
+    'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg'
+    + '?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40'
+    + '&numOfRows=5&pageNo=1'
     + `&fromTmFc=${yyyymmdd(from)}`
     + `&toTmFc=${yyyymmdd(now)}`
-    + `&dataType=JSON`;
+    + '&dataType=JSON'
+  );
 }
 
 async function fetchKMA() {
   try {
     const r = await axios.get(kmaUrl(), { timeout: 5000 });
-    if (String(r.data.response.header.resultCode) !== '0') throw 1;
-    kmaFail = 0;
+    if (String(r.data?.response?.header?.resultCode) !== '0') throw 1;
 
+    kmaFail = 0;
     const item = r.data.response.body.items?.item;
     return item ? (Array.isArray(item) ? item[0] : item) : null;
   } catch {
@@ -84,7 +86,7 @@ async function fetchKMA() {
   }
 }
 
-// ===== JMA =====
+/* ================= JMA ================= */
 async function fetchJMA() {
   try {
     const r = await axios.get(
@@ -92,14 +94,14 @@ async function fetchJMA() {
       { timeout: 5000 }
     );
     jmaFail = 0;
-    return r.data[0];
+    return r.data?.[0] || null;
   } catch {
     jmaFail++;
     return null;
   }
 }
 
-// ===== 장애 감지 =====
+/* ================= 장애 감지 ================= */
 async function 장애체크(channel) {
   if (장애알림보냄) return;
 
@@ -122,27 +124,34 @@ async function 장애체크(channel) {
   }
 }
 
-// ===== 메인 루프 =====
+/* ================= MAIN LOOP ================= */
 async function mainLoop() {
   if (!running) return;
 
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel) return;
+  if (!channel) {
+    setTimeout(mainLoop, 20000);
+    return;
+  }
 
   const kma = await fetchKMA();
   const jma = await fetchJMA();
 
-  // KMA 알림
-  if (kma && kma.eqkNo !== lastKMA) {
+  /* ----- KMA ----- */
+  if (kma && kma.eqkNo && kma.eqkNo !== lastKMA) {
     lastKMA = kma.eqkNo;
+
+    const mag = kma.mag != null ? String(kma.mag) : '정보없음';
+    const maxInt = kma.maxInt != null ? String(kma.maxInt) : '정보없음';
+    const loc = kma.loc || '위치 정보 없음';
     const mention = Number(kma.mag) >= 4 ? '@everyone ' : '';
 
     const e = new EmbedBuilder()
       .setTitle('🇰🇷 지진 발생')
-      .setDescription(kma.loc)
+      .setDescription(loc)
       .addFields(
-        { name: '규모', value: String(kma.mag), inline: true },
-        { name: '최대진도', value: kma.maxInt || '정보없음', inline: true }
+        { name: '규모', value: mag, inline: true },
+        { name: '최대진도', value: maxInt, inline: true }
       )
       .setFooter({ text: '출처: 기상청(KMA)' })
       .setTimestamp();
@@ -150,17 +159,21 @@ async function mainLoop() {
     await channel.send({ content: mention, embeds: [e] });
   }
 
-  // JMA 알림
-  if (jma && jma.time !== lastJMA) {
+  /* ----- JMA ----- */
+  if (jma && jma.time && jma.time !== lastJMA) {
     lastJMA = jma.time;
-    const mention = jma.maxInt >= 5 ? '@everyone ' : '';
+
+    const mag = jma.mag != null ? String(jma.mag) : '정보없음';
+    const maxInt = jma.maxInt != null ? String(jma.maxInt) : '정보없음';
+    const place = jma.place || '위치 정보 없음';
+    const mention = Number(jma.maxInt) >= 5 ? '@everyone ' : '';
 
     const e = new EmbedBuilder()
       .setTitle('🇯🇵 지진 발생')
-      .setDescription(jma.place)
+      .setDescription(place)
       .addFields(
-        { name: '규모', value: String(jma.mag), inline: true },
-        { name: '최대진도', value: String(jma.maxInt), inline: true }
+        { name: '규모', value: mag, inline: true },
+        { name: '최대진도', value: maxInt, inline: true }
       )
       .setFooter({ text: '출처: 일본기상청(JMA)' })
       .setTimestamp();
@@ -172,13 +185,13 @@ async function mainLoop() {
   setTimeout(mainLoop, 20000);
 }
 
-// ===== Ping =====
+/* ================= PING ================= */
 setInterval(() => {
   lastPing = Date.now();
   console.log('PING OK');
 }, 60000);
 
-// ===== Slash 처리 (수정 핵심) =====
+/* ================= SLASH HANDLER ================= */
 client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
 
@@ -206,12 +219,12 @@ client.on('interactionCreate', async i => {
   } catch (err) {
     console.error('Slash 처리 오류:', err);
     if (!i.replied && !i.deferred) {
-      await i.reply({ content: '명령 처리 중 오류 발생', ephemeral: true });
+      await i.reply({ content: '명령 처리 오류', ephemeral: true });
     }
   }
 });
 
-// ===== 시작 =====
+/* ================= START ================= */
 client.once('ready', async () => {
   console.log('봇 로그인 완료');
   await registerCommands();
