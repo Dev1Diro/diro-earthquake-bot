@@ -1,7 +1,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 // ===== Discord 클라이언트 =====
 const client = new Client({
@@ -13,11 +13,12 @@ const client = new Client({
 });
 
 // ===== 환경변수 =====
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const CHANNEL_ID = process.env.CHANNEL_ID;       // 숫자 ID
 const TOKEN = process.env.DISCORD_TOKEN;
 const KMA_API = process.env.KMA_API_KEY;
 const JMA_API = process.env.JMA_API_KEY;
 const PINGER_URL = process.env.PINGER_URL;
+const GUILD_ID = process.env.GUILD_ID;          // 테스트용 서버 ID
 const PORT = process.env.PORT || 3000;
 
 // ===== 이전 지진 기록 =====
@@ -47,8 +48,11 @@ async function fetchJMA() {
 
 // ===== 임베드 전송 =====
 async function sendEmbed(channel, source, place, magnitude, time) {
+    if (!channel || !channel.isTextBased()) {
+        console.error("sendEmbed: 유효하지 않은 채널");
+        return;
+    }
     try {
-        const { EmbedBuilder } = require('discord.js');
         const embed = new EmbedBuilder()
             .setTitle(`${source} 지진 발생`)
             .addFields(
@@ -108,10 +112,10 @@ async function sendPing() {
 
 // ===== 루프 시작 =====
 function startLoop(channel) {
-    setInterval(() => checkQuakes(channel), 20 * 1000);
-    setInterval(sendPing, 60 * 1000);
-    sendPing();
-    checkQuakes(channel);
+    setInterval(() => checkQuakes(channel), 20 * 1000); // 20초마다 지진 조회
+    setInterval(sendPing, 60 * 1000);                   // 1분마다 Ping
+    sendPing();                                         // 즉시 Ping
+    checkQuakes(channel);                               // 즉시 지진 체크
 }
 
 // ===== Express 서버 =====
@@ -130,13 +134,15 @@ client.once('ready', async () => {
             return;
         }
 
-        // Slash Command 등록 (글로벌)
+        // Guild Command 등록 → 바로 서버에 반영
         const rest = new REST({ version: '10' }).setToken(TOKEN);
         const commands = [
-            new SlashCommandBuilder().setName('stop').setDescription('봇 종료')
+            new SlashCommandBuilder()
+                .setName('stop')
+                .setDescription('봇 종료')
         ].map(cmd => cmd.toJSON());
 
-        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
         console.log("Slash Command 등록 완료");
 
         startLoop(channel);
@@ -151,8 +157,6 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === 'stop') {
-        if (!interaction.user.id) return; // 안전 체크
-
         await interaction.reply('봇을 종료합니다...');
         console.log("Stop 명령어 수신, 봇 종료");
         client.destroy();
@@ -161,3 +165,7 @@ client.on('interactionCreate', async interaction => {
 });
 
 client.login(TOKEN);
+
+// ===== 예외 처리 =====
+process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', err => console.error('Unhandled Rejection:', err));
