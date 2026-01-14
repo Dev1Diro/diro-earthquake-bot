@@ -1,7 +1,7 @@
 // ===== 환경변수 로드 =====
 require('dotenv').config();
 
-// ===== 즉시 검증 (여기 중요) =====
+// ===== 즉시 검증 =====
 console.log('TOKEN 존재:', !!process.env.TOKEN);
 console.log('DISCORD_CHANNEL_ID:', process.env.DISCORD_CHANNEL_ID);
 
@@ -26,16 +26,16 @@ function yyyymmdd(date) {
     return date.toISOString().slice(0, 10).replace(/-/g, '');
 }
 
-// ===== KMA URL 자동 생성 (최근 3일) =====
+// ===== KMA URL (네가 준 URL 기반, 날짜 자동) =====
 function getKMAUrl() {
-    const base = 'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg';
-
     const now = new Date();
     const from = new Date(now);
     from.setDate(from.getDate() - 3);
 
-    return `${base}?serviceKey=KMA_API_KEY_HARDCODED`
-        + `&numOfRows=10&pageNo=1`
+    return `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg`
+        + `?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40`
+        + `&numOfRows=10`
+        + `&pageNo=1`
         + `&fromTmFc=${yyyymmdd(from)}`
         + `&toTmFc=${yyyymmdd(now)}`
         + `&dataType=JSON`;
@@ -44,7 +44,8 @@ function getKMAUrl() {
 // ===== KMA 지진 조회 =====
 async function fetchKMA() {
     try {
-        const res = await axios.get(getKMAUrl(), { timeout: 5000 });
+        const url = getKMAUrl();
+        const res = await axios.get(url, { timeout: 5000 });
 
         const header = res.data?.response?.header;
         if (header?.resultCode !== '0') {
@@ -101,7 +102,7 @@ function earthquakeLoop() {
     setTimeout(earthquakeLoop, 20 * 1000);
 }
 
-// ===== 1분 핑 (Render 유지용) =====
+// ===== 1분 핑 =====
 function pingLoop() {
     if (!running) return;
     console.log('PING OK', new Date().toISOString());
