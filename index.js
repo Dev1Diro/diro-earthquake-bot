@@ -9,7 +9,7 @@ const {
   EmbedBuilder
 } = require('discord.js');
 
-/* ================= ENV ================= */
+/* ===== ENV ===== */
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
@@ -19,12 +19,10 @@ if (!TOKEN || !CLIENT_ID || !CHANNEL_ID) {
   process.exit(1);
 }
 
-/* ================= CLIENT ================= */
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
+/* ===== CLIENT ===== */
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-/* ================= STATE ================= */
+/* ===== STATE ===== */
 let lastKMA = null;
 let lastJMA = null;
 let kmaFail = 0;
@@ -33,30 +31,22 @@ let lastPing = Date.now();
 let 장애알림보냄 = false;
 let running = true;
 
-/* ================= SLASH COMMANDS ================= */
+/* ===== SLASH ===== */
 const commands = [
-  new SlashCommandBuilder()
-    .setName('stop')
-    .setDescription('봇 종료'),
-  new SlashCommandBuilder()
-    .setName('실시간정보')
-    .setDescription('지진봇 실시간 상태')
+  new SlashCommandBuilder().setName('stop').setDescription('봇 종료'),
+  new SlashCommandBuilder().setName('실시간정보').setDescription('지진봇 상태')
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 async function registerCommands() {
-  await rest.put(
-    Routes.applicationCommands(CLIENT_ID),
-    { body: commands }
-  );
-  console.log('슬래시 명령 등록 완료');
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
 }
 
-/* ================= UTIL ================= */
-const yyyymmdd = d => d.toISOString().slice(0, 10).replace(/-/g, '');
+/* ===== UTIL ===== */
+const ymd = d => d.toISOString().slice(0, 10).replace(/-/g, '');
 
-/* ================= KMA ================= */
+/* ===== KMA ===== */
 function kmaUrl() {
   const now = new Date();
   const from = new Date(now);
@@ -66,17 +56,16 @@ function kmaUrl() {
     'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg'
     + '?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40'
     + '&numOfRows=5&pageNo=1'
-    + `&fromTmFc=${yyyymmdd(from)}`
-    + `&toTmFc=${yyyymmdd(now)}`
+    + `&fromTmFc=${ymd(from)}`
+    + `&toTmFc=${ymd(now)}`
     + '&dataType=JSON'
   );
 }
 
 async function fetchKMA() {
   try {
-    const r = await axios.get(kmaUrl(), { timeout: 5000 });
+    const r = await axios.get(kmaUrl(), { timeout: 10000 });
     if (String(r.data?.response?.header?.resultCode) !== '0') throw 1;
-
     kmaFail = 0;
     const item = r.data.response.body.items?.item;
     return item ? (Array.isArray(item) ? item[0] : item) : null;
@@ -86,12 +75,12 @@ async function fetchKMA() {
   }
 }
 
-/* ================= JMA ================= */
+/* ===== JMA ===== */
 async function fetchJMA() {
   try {
     const r = await axios.get(
       'https://www.jma.go.jp/bosai/quake/data/list.json',
-      { timeout: 5000 }
+      { timeout: 10000 }
     );
     jmaFail = 0;
     return r.data?.[0] || null;
@@ -101,46 +90,19 @@ async function fetchJMA() {
   }
 }
 
-/* ================= 장애 감지 ================= */
-async function 장애체크(channel) {
-  if (장애알림보냄) return;
-
-  if (
-    kmaFail >= 3 ||
-    jmaFail >= 3 ||
-    Date.now() - lastPing > 120000
-  ) {
-    장애알림보냄 = true;
-
-    const e = new EmbedBuilder()
-      .setTitle('⚠️ 지진봇 장애 감지')
-      .setDescription(
-        `KMA 실패: ${kmaFail}\nJMA 실패: ${jmaFail}\nPing 지연`
-      )
-      .setColor(0xff0000)
-      .setTimestamp();
-
-    await channel.send({ embeds: [e] });
-  }
-}
-
-/* ================= MAIN LOOP ================= */
+/* ===== MAIN LOOP (1분) ===== */
 async function mainLoop() {
   if (!running) return;
 
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel) {
-    setTimeout(mainLoop, 20000);
-    return;
-  }
+  if (!channel) return;
 
   const kma = await fetchKMA();
   const jma = await fetchJMA();
 
-  /* ----- KMA ----- */
+  /* KMA */
   if (kma && kma.eqkNo && kma.eqkNo !== lastKMA) {
     lastKMA = kma.eqkNo;
-
     const mag = kma.mag != null ? String(kma.mag) : '정보없음';
     const maxInt = kma.maxInt != null ? String(kma.maxInt) : '정보없음';
     const loc = kma.loc || '위치 정보 없음';
@@ -159,10 +121,9 @@ async function mainLoop() {
     await channel.send({ content: mention, embeds: [e] });
   }
 
-  /* ----- JMA ----- */
+  /* JMA */
   if (jma && jma.time && jma.time !== lastJMA) {
     lastJMA = jma.time;
-
     const mag = jma.mag != null ? String(jma.mag) : '정보없음';
     const maxInt = jma.maxInt != null ? String(jma.maxInt) : '정보없음';
     const place = jma.place || '위치 정보 없음';
@@ -181,54 +142,62 @@ async function mainLoop() {
     await channel.send({ content: mention, embeds: [e] });
   }
 
-  await 장애체크(channel);
-  setTimeout(mainLoop, 20000);
+  /* 장애 */
+  if (!장애알림보냄 && (kmaFail >= 10 || jmaFail >= 10)) {
+    장애알림보냄 = true;
+    const e = new EmbedBuilder()
+      .setTitle('⚠️ 지진봇 장애 감지')
+      .setDescription(`KMA 실패 ${kmaFail}\nJMA 실패 ${jmaFail}`)
+      .setColor(0xff0000)
+      .setTimestamp();
+    await channel.send({ embeds: [e] });
+  }
+
+  /* 복구 */
+  if (장애알림보냄 && kmaFail === 0 && jmaFail === 0) {
+    장애알림보냄 = false;
+    const e = new EmbedBuilder()
+      .setTitle('✅ 지진봇 장애 복구')
+      .setColor(0x00ff00)
+      .setTimestamp();
+    await channel.send({ embeds: [e] });
+  }
 }
 
-/* ================= PING ================= */
+/* ===== INTERVALS ===== */
 setInterval(() => {
   lastPing = Date.now();
   console.log('PING OK');
 }, 60000);
 
-/* ================= SLASH HANDLER ================= */
+setInterval(mainLoop, 60000);
+
+/* ===== SLASH HANDLER ===== */
 client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
 
-  try {
-    if (i.commandName === 'stop') {
-      await i.deferReply({ ephemeral: true });
-      await i.editReply('봇 종료');
-      process.exit(0);
-    }
+  if (i.commandName === 'stop') {
+    await i.reply({ content: '봇 종료', ephemeral: true });
+    process.exit(0);
+  }
 
-    if (i.commandName === '실시간정보') {
-      await i.deferReply({ ephemeral: true });
-
-      const e = new EmbedBuilder()
-        .setTitle('📡 실시간 상태')
-        .addFields(
-          { name: 'KMA 실패', value: String(kmaFail), inline: true },
-          { name: 'JMA 실패', value: String(jmaFail), inline: true },
-          { name: 'Ping', value: new Date(lastPing).toLocaleString('ko-KR') }
-        )
-        .setTimestamp();
-
-      await i.editReply({ embeds: [e] });
-    }
-  } catch (err) {
-    console.error('Slash 처리 오류:', err);
-    if (!i.replied && !i.deferred) {
-      await i.reply({ content: '명령 처리 오류', ephemeral: true });
-    }
+  if (i.commandName === '실시간정보') {
+    const e = new EmbedBuilder()
+      .setTitle('📡 실시간 상태')
+      .addFields(
+        { name: 'KMA 실패', value: String(kmaFail), inline: true },
+        { name: 'JMA 실패', value: String(jmaFail), inline: true },
+        { name: 'Ping', value: new Date(lastPing).toLocaleString('ko-KR') }
+      )
+      .setTimestamp();
+    await i.reply({ embeds: [e], ephemeral: true });
   }
 });
 
-/* ================= START ================= */
+/* ===== START ===== */
 client.once('ready', async () => {
-  console.log('봇 로그인 완료');
   await registerCommands();
-  mainLoop();
+  console.log('봇 준비 완료');
 });
 
 client.login(TOKEN);
