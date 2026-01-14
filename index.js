@@ -1,95 +1,102 @@
-import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
-import fetch from "node-fetch";
-import express from "express";
+require('dotenv').config();
+const axios = require('axios');
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+
+// ===== 환경변수 =====
+const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const TOKEN = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+const KMA_KEY = process.env.KMA_API_KEY;
+const JMA_URL = process.env.JMA_URL || 'https://www.jma.go.jp/bosai/quake/data/list.json';
+const PINGER_URL = process.env.PINGER_URL;
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
+// ===== 새 이벤트 추적 =====
+let lastIndicesKMA = new Set();
+let lastIndicesJMA = new Set();
 
-// Render 핑용 간단 서버
-const app = express();
-app.get("/", (req, res) => res.send("OK"));
-app.listen(3000);
-
-let lastJmaId = null;
-
-// GMT+9 변환
-function toGMT9(timeStr) {
-  const d = new Date(timeStr);
-  d.setHours(d.getHours() + 9);
-  return d.toISOString().replace("T", " ").slice(0, 19);
+// ===== KMA 지진 데이터 조회 =====
+async function fetchKMA() {
+    try {
+        const nowTm = new Date().toISOString().slice(0,16).replace(/[-T:]/g,"");
+        const res = await axios.get('https://api.kma.go.kr/OPENAPI/DATA/Earthquake', {
+            params: { tm: nowTm, disp: 1, help: 0, authkey: KMA_KEY }
+        });
+        return res.data || [];
+    } catch(e) {
+        console.error("KMA fetch failed:", e.message);
+        return [];
+    }
 }
 
-// 지진 체크
-async function checkJMA() {
-  const channel = await client.channels.fetch(CHANNEL_ID);
-  if (!channel) return;
-
-  const list = await fetch("https://www.jma.go.jp/bosai/quake/data/list.json")
-    .then(r => r.json());
-
-  const latest = list[0];
-  if (!latest || latest.id === lastJmaId) return;
-  lastJmaId = latest.id;
-
-  const eq = latest.earthquake;
-  if (!eq) return;
-
-  const name = eq.hypocenter.name;
-  const mag = eq.magnitude;
-  const maxScale = eq.maxScale;
-  const time = toGMT9(eq.time);
-
-  let mention = "";
-  let title = "";
-
-  // 한국 지진
-  if (/Korea|대한민국|South/i.test(name)) {
-    if (mag >= 4.0) mention = "@everyone";
-    else return; // 4 미만은 메시지 없음
-    title = "🇰🇷 한국 지진 발생";
-  }
-  // 일본 지진
-  else if (/Japan|일본|Honshu|Hokkaido|Kyushu|北海道/i.test(name)) {
-    if (maxScale >= 55) mention = "@everyone"; // 5상 이상
-    else if (maxScale >= 40) mention = "@here"; // 4상 이상
-    else return; // 그 이하 무시
-    title = "🇯🇵 일본 지진 발생";
-  } else {
-    return;
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .addFields(
-      { name: "위치", value: name },
-      { name: "규모", value: mag ? mag.toString() : "정보없음", inline: true },
-      { name: "최대진도", value: maxScale ? maxScale.toString() : "해당없음", inline: true },
-      { name: "발생 시각 (GMT+9)", value: time }
-    )
-    .setFooter({ text: "출처: 일본기상청(JMA)" });
-
-  await channel.send({ content: mention, embeds: [embed] });
+// ===== JMA 지진 데이터 조회 =====
+async function fetchJMA() {
+    try {
+        const res = await axios.get(JMA_URL); // 이미 환경변수 URL에 API 키 포함
+        return res.data || [];
+    } catch(e) {
+        console.error("JMA fetch failed:", e.message);
+        return [];
+    }
 }
 
-// 봇 준비 완료 이벤트
-client.once("ready", async () => {
-  console.log("지진 알림 봇 실행됨");
+// ===== 디스코드 임베드 전송 =====
+async function sendEmbed(channel, source, place, magnitude, time) {
+    const embed = new EmbedBuilder()
+        .setTitle(`${source} 지진 발생`)
+        .addFields(
+            { name: '장소', value: place || '?', inline: true },
+            { name: '규모', value: magnitude?.toString() || '?', inline: true },
+            { name: '시간', value: time || '?', inline: true }
+        )
+        .setFooter({ text: `출처: ${source === 'KMA' ? '한국기상청' : '일본기상청(JMA)'}` })
+        .setColor(source === 'KMA' ? 0x1E90FF : 0xFF4500);
 
-  // 테스트용 강제 메시지
-  const channel = await client.channels.fetch(CHANNEL_ID);
-  if (channel) {
-    const testEmbed = new EmbedBuilder()
-      .setTitle("🧪 테스트 메시지")
-      .setDescription("봇 정상 작동 중");
-    await channel.send({ embeds: [testEmbed] });
-  }
+    await channel.send({ content: '@everyone', embeds: [embed] });
+}
 
-  // 30초마다 지진 체크
-  setInterval(checkJMA, 30000);
+// ===== 지진 체크 =====
+async function checkQuakes() {
+    const channel = client.channels.cache.get(CHANNEL_ID);
+    if (!channel) return;
+
+    // --- KMA ---
+    const kmaData = await fetchKMA();
+    const currentKMA = new Set(kmaData.map(e => e.index));
+    for (const e of kmaData) {
+        if (!lastIndicesKMA.has(e.index)) {
+            await sendEmbed(channel, 'KMA', e.place, e.magnitude, e.time);
+        }
+    }
+    lastIndicesKMA = currentKMA;
+
+    // --- JMA ---
+    const jmaData = await fetchJMA();
+    const currentJMA = new Set(jmaData.map(e => e.index));
+    for (const e of jmaData) {
+        if (!lastIndicesJMA.has(e.index)) {
+            await sendEmbed(channel, 'JMA', e.place, e.magnitude, e.time);
+        }
+    }
+    lastIndicesJMA = currentJMA;
+
+    // --- Render 핑거 호출 ---
+    if (PINGER_URL) {
+        try { await axios.get(PINGER_URL); } catch(e){ console.error("Ping failed:", e.message); }
+    }
+}
+
+// 30초마다 반복
+setInterval(checkQuakes, 30000);
+
+// 프로세스 예외 대응
+process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', err => console.error('Unhandled Rejection:', err));
+
+// 디스코드 로그인
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}`);
+    checkQuakes(); // 시작 직후 한번 실행
 });
 
 client.login(TOKEN);
