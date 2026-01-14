@@ -1,7 +1,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 // ===== Discord 클라이언트 =====
 const client = new Client({
@@ -13,18 +13,18 @@ const client = new Client({
 });
 
 // ===== 환경변수 =====
-const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const CHANNEL_ID = process.env.CHANNEL_ID;
 const TOKEN = process.env.DISCORD_TOKEN;
-const KMA_API = process.env.KMA_API_KEY; // env: URL+Key
-const JMA_API = process.env.JMA_API_KEY; // env: URL+Key
+const KMA_API = process.env.KMA_API_KEY;
+const JMA_API = process.env.JMA_API_KEY;
 const PINGER_URL = process.env.PINGER_URL;
 const PORT = process.env.PORT || 3000;
 
-// ===== 이전 지진 기록 저장 =====
+// ===== 이전 지진 기록 =====
 let lastKMA = new Set();
 let lastJMA = new Set();
 
-// ===== KMA 지진 조회 =====
+// ===== KMA/JMA 조회 =====
 async function fetchKMA() {
     try {
         const res = await axios.get(KMA_API, { timeout: 10000 });
@@ -35,7 +35,6 @@ async function fetchKMA() {
     }
 }
 
-// ===== JMA 지진 조회 =====
 async function fetchJMA() {
     try {
         const res = await axios.get(JMA_API, { timeout: 10000 });
@@ -46,9 +45,10 @@ async function fetchJMA() {
     }
 }
 
-// ===== 임베드 메시지 전송 =====
+// ===== 임베드 전송 =====
 async function sendEmbed(channel, source, place, magnitude, time) {
     try {
+        const { EmbedBuilder } = require('discord.js');
         const embed = new EmbedBuilder()
             .setTitle(`${source} 지진 발생`)
             .addFields(
@@ -74,7 +74,9 @@ async function checkQuakes(channel) {
         const kmaData = await fetchKMA();
         const currentK = new Set(kmaData.map(e => e.index));
         for (const e of kmaData) {
-            if (!lastKMA.has(e.index)) await sendEmbed(channel, 'KMA', e.place, e.magnitude, e.time);
+            if (!lastKMA.has(e.index)) {
+                await sendEmbed(channel, 'KMA', e.place, e.magnitude, e.time);
+            }
         }
         lastKMA = currentK;
 
@@ -82,9 +84,12 @@ async function checkQuakes(channel) {
         const jmaData = await fetchJMA();
         const currentJ = new Set(jmaData.map(e => e.index));
         for (const e of jmaData) {
-            if (!lastJMA.has(e.index)) await sendEmbed(channel, 'JMA', e.place, e.magnitude, e.time);
+            if (!lastJMA.has(e.index)) {
+                await sendEmbed(channel, 'JMA', e.place, e.magnitude, e.time);
+            }
         }
         lastJMA = currentJ;
+
     } catch (err) {
         console.error("checkQuakes error:", err.message);
     }
@@ -103,10 +108,10 @@ async function sendPing() {
 
 // ===== 루프 시작 =====
 function startLoop(channel) {
-    setInterval(() => checkQuakes(channel), 20 * 1000); // 20초마다 지진 체크
-    setInterval(sendPing, 60 * 1000); // 1분마다 Ping + 콘솔 표시
-    sendPing();      // 시작 직후 Ping
-    checkQuakes(channel); // 시작 직후 지진 체크
+    setInterval(() => checkQuakes(channel), 20 * 1000);
+    setInterval(sendPing, 60 * 1000);
+    sendPing();
+    checkQuakes(channel);
 }
 
 // ===== Express 서버 =====
@@ -114,11 +119,7 @@ const app = express();
 app.get('/', (req, res) => res.send('Bot Active'));
 app.listen(PORT, () => console.log(`Web server on port ${PORT}`));
 
-// ===== 예외 처리 =====
-process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
-process.on('unhandledRejection', err => console.error('Unhandled Rejection:', err));
-
-// ===== Discord 로그인 & 시작 =====
+// ===== Discord 로그인 & Slash Command 등록 =====
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
@@ -128,9 +129,34 @@ client.once('ready', async () => {
             console.error("유효한 텍스트 채널이 아님");
             return;
         }
+
+        // Slash Command 등록 (글로벌)
+        const rest = new REST({ version: '10' }).setToken(TOKEN);
+        const commands = [
+            new SlashCommandBuilder().setName('stop').setDescription('봇 종료')
+        ].map(cmd => cmd.toJSON());
+
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log("Slash Command 등록 완료");
+
         startLoop(channel);
+
     } catch (err) {
         console.error("Channel fetch error:", err.message);
+    }
+});
+
+// ===== Slash Command 처리 =====
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    if (interaction.commandName === 'stop') {
+        if (!interaction.user.id) return; // 안전 체크
+
+        await interaction.reply('봇을 종료합니다...');
+        console.log("Stop 명령어 수신, 봇 종료");
+        client.destroy();
+        process.exit(0);
     }
 });
 
