@@ -118,7 +118,7 @@ async function 장애체크(channel) {
       .setColor(0xff0000)
       .setTimestamp();
 
-    channel.send({ embeds: [e] });
+    await channel.send({ embeds: [e] });
   }
 }
 
@@ -147,7 +147,7 @@ async function mainLoop() {
       .setFooter({ text: '출처: 기상청(KMA)' })
       .setTimestamp();
 
-    channel.send({ content: mention, embeds: [e] });
+    await channel.send({ content: mention, embeds: [e] });
   }
 
   // JMA 알림
@@ -165,7 +165,7 @@ async function mainLoop() {
       .setFooter({ text: '출처: 일본기상청(JMA)' })
       .setTimestamp();
 
-    channel.send({ content: mention, embeds: [e] });
+    await channel.send({ content: mention, embeds: [e] });
   }
 
   await 장애체크(channel);
@@ -178,26 +178,36 @@ setInterval(() => {
   console.log('PING OK');
 }, 60000);
 
-// ===== Slash 처리 =====
+// ===== Slash 처리 (수정 핵심) =====
 client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
 
-  if (i.commandName === 'stop') {
-    await i.reply('봇 종료');
-    process.exit(0);
-  }
+  try {
+    if (i.commandName === 'stop') {
+      await i.deferReply({ ephemeral: true });
+      await i.editReply('봇 종료');
+      process.exit(0);
+    }
 
-  if (i.commandName === '실시간정보') {
-    const e = new EmbedBuilder()
-      .setTitle('📡 실시간 상태')
-      .addFields(
-        { name: 'KMA 실패', value: String(kmaFail), inline: true },
-        { name: 'JMA 실패', value: String(jmaFail), inline: true },
-        { name: 'Ping', value: new Date(lastPing).toLocaleString('ko-KR') }
-      )
-      .setTimestamp();
+    if (i.commandName === '실시간정보') {
+      await i.deferReply({ ephemeral: true });
 
-    await i.reply({ embeds: [e], ephemeral: true });
+      const e = new EmbedBuilder()
+        .setTitle('📡 실시간 상태')
+        .addFields(
+          { name: 'KMA 실패', value: String(kmaFail), inline: true },
+          { name: 'JMA 실패', value: String(jmaFail), inline: true },
+          { name: 'Ping', value: new Date(lastPing).toLocaleString('ko-KR') }
+        )
+        .setTimestamp();
+
+      await i.editReply({ embeds: [e] });
+    }
+  } catch (err) {
+    console.error('Slash 처리 오류:', err);
+    if (!i.replied && !i.deferred) {
+      await i.reply({ content: '명령 처리 중 오류 발생', ephemeral: true });
+    }
   }
 });
 
