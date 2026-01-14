@@ -21,7 +21,6 @@ let lastIndicesJMA = new Set();
 // ===== KMA 지진 데이터 조회 =====
 async function fetchKMA() {
     try {
-        // tm 등 필요 인자 예시, 실제 API 문서 참고
         const nowTm = new Date().toISOString().slice(0,16).replace(/[-T:]/g,"");
         const res = await axios.get('', { params: { tm: nowTm, disp: 1, help: 0, authkey: KMA_KEY } });
         return res.data || [];
@@ -78,7 +77,7 @@ async function sendPing(retries = 3) {
     if (!PINGER_URL) return;
     for (let i = 0; i < retries; i++) {
         try {
-            await axios.get(PINGER_URL, { timeout: 5000 });
+            await axios.get(PINGER_URL, { timeout: 10000 });
             console.log("Ping 성공:", PINGER_URL);
             break;
         } catch(e) {
@@ -89,9 +88,9 @@ async function sendPing(retries = 3) {
 }
 
 // ===== 반복 실행 =====
-setInterval(checkQuakes, 30000);  // 30초마다 지진 체크
-setInterval(sendPing, 5*60*1000); // 5분마다 Ping
-sendPing();                        // 시작 직후 Ping
+setInterval(checkQuakes, 30000);   // 30초마다 지진 체크
+setInterval(sendPing, 60*1000);    // 1분마다 Ping
+sendPing();                         // 시작 직후 Ping
 
 // ===== Render 상태 체크용 서버 =====
 const app = express();
