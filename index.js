@@ -1,173 +1,207 @@
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits
+} = require('discord.js');
 const axios = require('axios');
+const cheerio = require('cheerio');
 
-/* ===== 설정 ===== */
+/* ===== ENV ===== */
 const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const APPLICATION_ID = process.env.APPLICATION_ID;
 
-/* ===== API URL 하드코딩 ===== */
-const KMA_URL = 'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40&numOfRows=10&pageNo=1&fromTmFc=20260115&toTmFc=20270115';
-const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
-const DISASTER_URL = 'https://www.safetydata.go.kr/V2/api/DSSP-IF-00247?serviceKey=65H684WY1VX42LFO';
-
-/* ===== 디스코드 클라이언트 ===== */
+/* ===== CLIENT ===== */
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
-    partials: [Partials.Channel]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
-/* ===== 상태 ===== */
-let sentKMA = new Set();
-let sentJMA = new Set();
-let sentDisaster = new Set();
-let pingFailures = 0;
+/* ===== URL ===== */
+const NHK_EEW = 'https://www3.nhk.or.jp/sokuho/jishin/data/JishinEEW.json';
+const NHK_REPORT = 'https://www3.nhk.or.jp/sokuho/jishin/data/JishinReport.json';
+const JMA_FAST = 'https://www.jma.go.jp/bosai/quake/data/earthquake_recent.json';
 
-/* ===== 안전하게 문자열 변환 ===== */
-function safeStr(value) {
-    if (value === undefined || value === null) return '';
-    if (typeof value === 'object') return JSON.stringify(value);
-    return String(value);
+const KMA_URL =
+'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg' +
+'?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40' +
+'&numOfRows=10&pageNo=1&fromTmFc=20260115&toTmFc=20270115';
+
+const SEOUL_EMER =
+'https://news.seoul.go.kr/safety/archives/category/emergency';
+
+/* ===== STATE ===== */
+const sent = new Set();
+
+/* ===== UTIL ===== */
+const isStr = v => typeof v === 'string' && v.trim() !== '';
+const key = (...v) => v.join('|');
+
+async function send(title, desc, mention=false) {
+  if (!isStr(desc)) return;
+  const ch = await client.channels.fetch(CHANNEL_ID);
+  if (!ch) return;
+
+  await ch.send({
+    content: mention ? '@everyone' : undefined,
+    embeds: [new EmbedBuilder().setTitle(title).setDescription(desc).setTimestamp()]
+  });
 }
 
-/* ===== 임베드 전송 ===== */
-async function sendEmbed(title, desc, color='#FFFF00') {
-    if(!desc || desc.trim()==='') return;
-    try {
-        const channel = await client.channels.fetch(CHANNEL_ID);
-        if(!channel) return;
-        const embed = new EmbedBuilder()
-            .setTitle(title)
-            .setDescription(desc)
-            .setColor(color)
-            .setTimestamp();
-        await channel.send({ embeds: [embed] });
-    } catch(e){ console.error('임베드 전송 실패:', e.message); }
-}
-
-/* ===== fetch 함수 ===== */
-async function fetchKMA(){ try{ const res = await axios.get(KMA_URL); return res.data?.response?.body?.items?.item || []; }catch{return [];} }
-async function fetchJMA(){ try{ const res = await axios.get(JMA_URL); return res.data || []; }catch{return [];} }
-async function fetchDisaster(){ try{ const res = await axios.get(DISASTER_URL); return res.data?.response?.body?.items?.item || []; }catch{return [];} }
-
-/* ===== Ping 루프 1분 ===== */
-function startPingLoop(){
-    setInterval(async()=>{
-        try{ await axios.get('https://www.google.com'); pingFailures=0; }catch{ pingFailures++; }
-    }, 60_000);
-}
-
-/* ===== 메인 루프 20초 ===== */
-function startLoop(){
-    setInterval(async()=>{
-
-        /* ===== KMA 지진 ===== */
-        const kmaData = await fetchKMA();
-        for(const eq of kmaData){
-            const key = `${safeStr(eq.earthquakeNo)}-${safeStr(eq.eqPlace)}`;
-            if(sentKMA.has(key)) continue;
-            if(!eq.eqPlace || !eq.maxInten) continue;
-
-            const place = safeStr(eq.eqPlace);
-            const magnitude = safeStr(eq.eqMagnitude || '정보없음');
-            const intensity = safeStr(eq.maxInten);
-            const desc = `위치: ${place}\n규모: ${magnitude}\n진도: ${intensity}`;
-
-            const isMent = Number(eq.maxInten) >= 4;
-            sentKMA.add(key);
-
-            await sendEmbed(
-                isMent ? '🇰🇷 KMA 지진 🔶 @everyone' : '🇰🇷 KMA 지진 🔶',
-                isMent ? `@everyone\n${desc}` : desc,
-                '#FFA500'
-            );
-        }
-
-        /* ===== JMA 지진 ===== */
-        const jmaData = await fetchJMA();
-        for(const eq of jmaData){
-            const key = `${safeStr(eq.code)}-${safeStr(eq.place)}`;
-            if(sentJMA.has(key)) continue;
-            if(!eq.place || !eq.intensity || !eq.magnitude) continue;
-
-            const place = safeStr(eq.place);
-            const magnitude = safeStr(eq.magnitude);
-            const intensity = safeStr(eq.intensity);
-            const desc = `위치: ${place}\n규모: ${magnitude}\n최대진도: ${intensity}`;
-
-            const isMent = eq.intensity.includes('5+'); // 5+ 이상만 멘션
-            sentJMA.add(key);
-
-            await sendEmbed(
-                isMent ? '🇯🇵 JMA 지진 🔴 @everyone' : '🇯🇵 JMA 지진 🔴',
-                isMent ? `@everyone\n${desc}` : desc,
-                '#FF0000'
-            );
-        }
-
-        /* ===== 재난문자 ===== */
-        const disasterData = await fetchDisaster();
-        for(const d of disasterData){
-            const key = `${safeStr(d.msgNo)}`;
-            if(sentDisaster.has(key)) continue;
-            if(!d.msg || !d.level) continue;
-
-            const msg = safeStr(d.msg);
-            const isMent = d.level==='긴급'||d.level==='위급';
-            sentDisaster.add(key);
-
-            await sendEmbed(
-                isMent ? '⚠️ 재난 알림 @everyone' : '⚠️ 재난 알림',
-                isMent ? `@everyone\n${msg}` : msg,
-                '#1E90FF'
-            );
-        }
-
-    }, 20_000);
-}
-
-/* ===== 슬래시 명령어 등록 ===== */
+/* ===== SLASH COMMANDS ===== */
 const commands = [
-    new SlashCommandBuilder().setName('청소').setDescription('채널 메시지 삭제').addIntegerOption(opt=>opt.setName('수량').setDescription('삭제할 메시지 수').setRequired(true)).toJSON(),
-    new SlashCommandBuilder().setName('stop').setDescription('봇 종료').toJSON(),
-    new SlashCommandBuilder().setName('실시간정보').setDescription('봇 상태 확인').toJSON()
-];
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('봇 종료'),
 
-const rest = new REST({ version:'10' }).setToken(TOKEN);
-async function registerCommands(){
-    try{ await rest.put(Routes.applicationCommands(APPLICATION_ID), {body:commands}); console.log('슬래시 명령어 등록 완료'); }
-    catch(e){ console.error('슬래시 명령어 등록 실패', e.message); }
-}
+  new SlashCommandBuilder()
+    .setName('청소')
+    .setDescription('메시지 삭제')
+    .addIntegerOption(o =>
+      o.setName('수량')
+       .setDescription('1~100')
+       .setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+].map(c => c.toJSON());
 
-/* ===== 슬래시 명령어 처리 ===== */
-client.on('interactionCreate', async interaction=>{
-    if(!interaction.isCommand()) return;
-    const cmd = interaction.commandName;
+const rest = new REST({ version: '10' }).setToken(TOKEN);
 
-    if(cmd==='청소'){
-        const n = interaction.options.getInteger('수량');
-        if(n<1||n>100) return interaction.reply({content:'1~100만 가능합니다.', ephemeral:true});
-        try{
-            const msgs = await interaction.channel.messages.fetch({limit:n});
-            await interaction.channel.bulkDelete(msgs,true);
-            return interaction.reply({content:`${n}개 메시지 삭제 완료`, ephemeral:true});
-        }catch{return interaction.reply({content:'메시지 삭제 실패', ephemeral:true});}
-    }
-
-    if(cmd==='stop'){ await interaction.reply('봇 종료 중'); process.exit(0); }
-
-    if(cmd==='실시간정보'){
-        const status = `Ping 실패: ${pingFailures}\nKMA 알람: ${sentKMA.size}\nJMA 알람: ${sentJMA.size}\n재난: ${sentDisaster.size}`;
-        return interaction.reply({embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(status).setColor('#00FF00').setTimestamp()], ephemeral:true});
-    }
+client.once('ready', async () => {
+  await rest.put(
+    Routes.applicationCommands(APPLICATION_ID),
+    { body: commands }
+  );
+  console.log('봇 온라인');
 });
 
-/* ===== 시작 ===== */
-client.once('ready', async()=>{
-    console.log(`${client.user.tag} 온라인`);
-    startPingLoop();
-    startLoop();
-    registerCommands();
+/* ===== COMMAND HANDLER ===== */
+client.on('interactionCreate', async i => {
+  if (!i.isCommand()) return;
+
+  if (i.commandName === 'stop') {
+    await i.reply('봇 종료');
+    process.exit(0);
+  }
+
+  if (i.commandName === '청소') {
+    const n = i.options.getInteger('수량');
+    if (n < 1 || n > 100) {
+      return i.reply({ content: '1~100만 가능', ephemeral: true });
+    }
+    const msgs = await i.channel.messages.fetch({ limit: n });
+    await i.channel.bulkDelete(msgs, true);
+    await i.reply({ content: `${msgs.size}개 삭제`, ephemeral: true });
+  }
 });
+
+/* ===== PING ===== */
+setInterval(() => {
+  axios.get('https://www.google.com').catch(()=>{});
+}, 60_000);
+
+/* ===== NHK EEW (15s) ===== */
+setInterval(async () => {
+  try {
+    const { data } = await axios.get(NHK_EEW);
+    for (const e of data) {
+      if (!isStr(e.hypocenter) || !isStr(e.maxint) || !isStr(e.origin_time)) continue;
+      const k = key('EEW', e.origin_time, e.hypocenter);
+      if (sent.has(k)) continue;
+      sent.add(k);
+
+      send(
+        '🇯🇵 NHK 지진 예보(EEW)',
+        `위치: ${e.hypocenter}\n예상 최대진도: ${e.maxint}`,
+        e.maxint.includes('5')
+      );
+    }
+  } catch {}
+}, 15_000);
+
+/* ===== NHK REPORT (30s) ===== */
+setInterval(async () => {
+  try {
+    const { data } = await axios.get(NHK_REPORT);
+    for (const e of data) {
+      if (!isStr(e.hypocenter) || !isStr(e.magnitude) || !isStr(e.maxint)) continue;
+      const k = key('NHK', e.origin_time, e.hypocenter);
+      if (sent.has(k)) continue;
+      sent.add(k);
+
+      send(
+        '🇯🇵 NHK 지진 속보',
+        `위치: ${e.hypocenter}\n규모: ${e.magnitude}\n최대진도: ${e.maxint}`,
+        e.maxint.includes('5')
+      );
+    }
+  } catch {}
+}, 30_000);
+
+/* ===== JMA FAST (45s) ===== */
+setInterval(async () => {
+  try {
+    const { data } = await axios.get(JMA_FAST);
+    const now = Date.now();
+    for (const e of data) {
+      if (!isStr(e.place) || !isStr(e.intensity) || !isStr(e.time)) continue;
+      if (now - new Date(e.time).getTime() > 300000) continue;
+      const k = key('JMA', e.time, e.place);
+      if (sent.has(k)) continue;
+      sent.add(k);
+
+      send(
+        '🇯🇵 JMA 실시간 지진',
+        `위치: ${e.place}\n규모: ${e.magnitude}\n최대진도: ${e.intensity}`,
+        e.intensity.includes('5+')
+      );
+    }
+  } catch {}
+}, 45_000);
+
+/* ===== KMA (60s) ===== */
+setInterval(async () => {
+  try {
+    const { data } = await axios.get(KMA_URL);
+    const items = data?.response?.body?.items?.item || [];
+    for (const e of items) {
+      if (!isStr(e.eqPlace) || !isStr(e.eqMagnitude) || !isStr(e.maxInten)) continue;
+      const k = key('KMA', e.earthquakeNo);
+      if (sent.has(k)) continue;
+      sent.add(k);
+
+      send(
+        '🇰🇷 KMA 지진',
+        `위치: ${e.eqPlace}\n규모: ${e.eqMagnitude}\n진도: ${e.maxInten}`,
+        Number(e.maxInten) >= 4
+      );
+    }
+  } catch {}
+}, 60_000);
+
+/* ===== SEOUL EMERGENCY (90s) ===== */
+setInterval(async () => {
+  try {
+    const html = await axios.get(SEOUL_EMER);
+    const $ = cheerio.load(html.data);
+    $('.list_body li').slice(0,3).each((_, el) => {
+      const title = $(el).find('a').text().trim();
+      const date = $(el).find('.date').text().trim();
+      if (!isStr(title) || !isStr(date)) return;
+      const k = key('SEOUL', title, date);
+      if (sent.has(k)) return;
+      sent.add(k);
+
+      send('⚠️ 서울 안전안내문자', `${title}\n(${date})`, true);
+    });
+  } catch {}
+}, 90_000);
 
 client.login(TOKEN);
