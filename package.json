@@ -6,14 +6,9 @@
   "scripts": {
     "start": "node index.js"
   },
-  "author": "",
-  "license": "MIT",
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "engines": { "node": ">=18.0.0" },
   "dependencies": {
     "axios": "^1.6.0",
-    "discord.js": "^14.16.0",
-    "dotenv": "^16.3.1"
+    "discord.js": "^14.16.0"
   }
 }

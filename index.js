@@ -1,9 +1,10 @@
-const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const axios = require('axios');
 
 /* ===== 설정 ===== */
 const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const APPLICATION_ID = process.env.APPLICATION_ID;
 
 /* ===== API URL 하드코딩 ===== */
 const KMA_URL = 'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40&numOfRows=10&pageNo=1&fromTmFc=20260115&toTmFc=20270115';
@@ -12,11 +13,7 @@ const DISASTER_URL = 'https://www.safetydata.go.kr/V2/api/DSSP-IF-00247?serviceK
 
 /* ===== 디스코드 클라이언트 ===== */
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
     partials: [Partials.Channel]
 });
 
@@ -28,7 +25,7 @@ let pingFailures = 0;
 
 /* ===== 임베드 전송 ===== */
 async function sendEmbed(title, desc, color='#FFFF00') {
-    if(!desc || desc.trim() === '') return;
+    if(!desc || desc.trim()==='') return;
     try {
         const channel = await client.channels.fetch(CHANNEL_ID);
         if(!channel) return;
@@ -38,7 +35,7 @@ async function sendEmbed(title, desc, color='#FFFF00') {
             .setColor(color)
             .setTimestamp();
         await channel.send({ embeds: [embed] });
-    } catch(e) { console.error('임베드 전송 실패:', e.message); }
+    } catch(e){ console.error('임베드 전송 실패:', e.message); }
 }
 
 /* ===== fetch 함수 ===== */
@@ -48,13 +45,8 @@ async function fetchDisaster(){ try{ const res = await axios.get(DISASTER_URL); 
 
 /* ===== Ping 루프 1분 ===== */
 function startPingLoop(){
-    setInterval(async ()=>{
-        try{
-            await axios.get('https://www.google.com');
-            pingFailures = 0;
-        }catch{
-            pingFailures++;
-        }
+    setInterval(async()=>{
+        try{ await axios.get('https://www.google.com'); pingFailures=0; }catch{ pingFailures++; }
     }, 60_000);
 }
 
@@ -68,10 +60,9 @@ function startLoop(){
             const key = `${eq.earthquakeNo||''}-${eq.eqPlace||''}`;
             if(sentKMA.has(key)) continue;
             if(!eq.eqPlace || !eq.maxInten) continue;
-            if(Number(eq.maxInten) < 4) continue;
+            if(Number(eq.maxInten)<4) continue;
             sentKMA.add(key);
-            const desc = `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`;
-            await sendEmbed('🇰🇷 KMA 지진 🔶', desc, '#FFA500');
+            await sendEmbed('🇰🇷 KMA 지진 🔶', `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`, '#FFA500');
         }
 
         /* JMA 5+ */
@@ -80,11 +71,10 @@ function startLoop(){
             const key = `${eq.code||''}-${eq.place||''}`;
             if(sentJMA.has(key)) continue;
             if(!eq.place || !eq.intensity || !eq.magnitude) continue;
-            sentJMA.add(key);
             const is5Plus = eq.intensity.includes('5+');
             if(!is5Plus) continue;
-            const desc = `@everyone\n위치: ${eq.place}\n규모: ${eq.magnitude}\n최대진도: ${eq.intensity}`;
-            await sendEmbed('🇯🇵 JMA 지진 🔴', desc, '#FF0000');
+            sentJMA.add(key);
+            await sendEmbed('🇯🇵 JMA 지진 🔴', `@everyone\n위치: ${eq.place}\n규모: ${eq.magnitude}\n최대진도: ${eq.intensity}`, '#FF0000');
         }
 
         /* 재난문자 (긴급, 위급만) */
@@ -95,18 +85,31 @@ function startLoop(){
             if(!d.msg || !d.level) continue;
             if(d.level!=='긴급' && d.level!=='위급') continue;
             sentDisaster.add(key);
-            const msg = `@everyone\n${d.msg}`;
-            await sendEmbed('⚠️ 재난 알림', msg, '#1E90FF');
+            await sendEmbed('⚠️ 재난 알림', `@everyone\n${d.msg}`, '#1E90FF');
         }
 
     }, 20_000);
 }
 
-/* ===== 슬래시 명령어 처리 (청소, stop, 실시간정보) ===== */
+/* ===== 슬래시 명령어 등록 ===== */
+const commands = [
+    new SlashCommandBuilder().setName('청소').setDescription('채널 메시지 삭제').addIntegerOption(opt=>opt.setName('수량').setDescription('삭제할 메시지 수').setRequired(true)).toJSON(),
+    new SlashCommandBuilder().setName('stop').setDescription('봇 종료').toJSON(),
+    new SlashCommandBuilder().setName('실시간정보').setDescription('봇 상태 확인').toJSON()
+];
+
+const rest = new REST({ version:'10' }).setToken(TOKEN);
+async function registerCommands(){
+    try{ await rest.put(Routes.applicationCommands(APPLICATION_ID), {body:commands}); console.log('슬래시 명령어 등록 완료'); }
+    catch(e){ console.error('슬래시 명령어 등록 실패', e.message); }
+}
+
+/* ===== 슬래시 명령어 처리 ===== */
 client.on('interactionCreate', async interaction=>{
     if(!interaction.isCommand()) return;
+    const cmd = interaction.commandName;
 
-    if(interaction.commandName==='청소'){
+    if(cmd==='청소'){
         const n = interaction.options.getInteger('수량');
         if(n<1 || n>100) return interaction.reply({content:'1~100만 가능합니다.', ephemeral:true});
         try{
@@ -116,17 +119,11 @@ client.on('interactionCreate', async interaction=>{
         }catch{return interaction.reply({content:'메시지 삭제 실패', ephemeral:true});}
     }
 
-    if(interaction.commandName==='stop'){
-        await interaction.reply('봇 종료 중');
-        process.exit(0);
-    }
+    if(cmd==='stop'){ await interaction.reply('봇 종료 중'); process.exit(0); }
 
-    if(interaction.commandName==='실시간정보'){
-        const statusText = `Ping 실패: ${pingFailures}\nKMA 알람 전송 수: ${sentKMA.size}\nJMA 알람 전송 수: ${sentJMA.size}\n재난문자 전송 수: ${sentDisaster.size}`;
-        return interaction.reply({
-            embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(statusText).setColor('#00FF00').setTimestamp()],
-            ephemeral:true
-        });
+    if(cmd==='실시간정보'){
+        const status = `Ping 실패: ${pingFailures}\nKMA 알람: ${sentKMA.size}\nJMA 알람: ${sentJMA.size}\n재난: ${sentDisaster.size}`;
+        return interaction.reply({embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(status).setColor('#00FF00').setTimestamp()], ephemeral:true});
     }
 });
 
@@ -135,6 +132,7 @@ client.once('ready', async()=>{
     console.log(`${client.user.tag} 온라인`);
     startPingLoop();
     startLoop();
+    registerCommands();
 });
 
 client.login(TOKEN);
