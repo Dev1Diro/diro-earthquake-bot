@@ -25,14 +25,14 @@ const client = new Client({
   ]
 });
 
-/* ===== ERROR SAFETY ===== */
+/* ===== ERROR SAFETY + DEBUG ===== */
 client.on('error', err => {
-  console.error('[DISCORD ERROR]', err.message);
-  adminAlert(`Discord 오류\n${err.message}`);
+  console.error('[DISCORD ERROR]', err);
+  adminAlert(`Discord error\n${err.message}`);
 });
 
 process.on('unhandledRejection', err => {
-  console.error('[UNHANDLED REJECTION]', err);
+  console.error('[UNHANDLED REJECTION]', err?.rawError?.errors || err);
   adminAlert(`UnhandledRejection\n${err}`);
 });
 
@@ -70,20 +70,27 @@ async function adminAlert(msg) {
   } catch {}
 }
 
+/* ===== SAFE SEND (중요) ===== */
 async function send(title, desc, mention=false) {
   if (!isStr(desc)) return null;
+
   const ch = await client.channels.fetch(CHANNEL_ID);
   if (!ch) return null;
 
-  return ch.send({
-    content: mention ? '@everyone' : undefined,
+  const payload = {
     embeds: [
       new EmbedBuilder()
-        .setTitle(title)
-        .setDescription(desc)
+        .setTitle(String(title).slice(0, 256))
+        .setDescription(String(desc).slice(0, 4000))
         .setTimestamp()
     ]
-  });
+  };
+
+  if (mention === true) {
+    payload.content = '@everyone';
+  }
+
+  return ch.send(payload);
 }
 
 /* ===== SLASH COMMANDS ===== */
@@ -138,7 +145,7 @@ setInterval(() => {
   axios.get('https://www.google.com').catch(()=>{});
 }, 60_000);
 
-/* ===== NHK EEW (15s) ===== */
+/* ===== NHK EEW ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(NHK_EEW);
@@ -163,7 +170,7 @@ setInterval(async () => {
   }
 }, 15_000);
 
-/* ===== NHK REPORT (30s) ===== */
+/* ===== NHK REPORT ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(NHK_REPORT);
@@ -204,7 +211,7 @@ setInterval(async () => {
   }
 }, 30_000);
 
-/* ===== JMA FAST (45s) ===== */
+/* ===== JMA ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(JMA_FAST);
@@ -227,7 +234,7 @@ setInterval(async () => {
   }
 }, 45_000);
 
-/* ===== KMA (60s) ===== */
+/* ===== KMA ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(KMA_URL);
@@ -251,7 +258,7 @@ setInterval(async () => {
   }
 }, 60_000);
 
-/* ===== SEOUL EMERGENCY (90s) ===== */
+/* ===== SEOUL ===== */
 setInterval(async () => {
   try {
     const html = await axios.get(SEOUL_EMER);
