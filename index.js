@@ -13,6 +13,7 @@ const cheerio = require('cheerio');
 /* ===== ENV ===== */
 const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 const APPLICATION_ID = process.env.APPLICATION_ID;
 
 /* ===== CLIENT ===== */
@@ -22,6 +23,22 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent
   ]
+});
+
+/* ===== ERROR SAFETY ===== */
+client.on('error', err => {
+  console.error('[DISCORD ERROR]', err.message);
+  adminAlert(`Discord 오류\n${err.message}`);
+});
+
+process.on('unhandledRejection', err => {
+  console.error('[UNHANDLED REJECTION]', err);
+  adminAlert(`UnhandledRejection\n${err}`);
+});
+
+process.on('uncaughtException', err => {
+  console.error('[UNCAUGHT EXCEPTION]', err);
+  adminAlert(`UncaughtException\n${err}`);
 });
 
 /* ===== URL ===== */
@@ -39,19 +56,33 @@ const SEOUL_EMER =
 
 /* ===== STATE ===== */
 const sent = new Set();
+const eewMap = new Map();
+const apiFail = { NHK: 0, JMA: 0, KMA: 0 };
 
 /* ===== UTIL ===== */
 const isStr = v => typeof v === 'string' && v.trim() !== '';
 const key = (...v) => v.join('|');
 
-async function send(title, desc, mention=false) {
-  if (!isStr(desc)) return;
-  const ch = await client.channels.fetch(CHANNEL_ID);
-  if (!ch) return;
+async function adminAlert(msg) {
+  try {
+    const ch = await client.channels.fetch(ADMIN_CHANNEL_ID);
+    if (ch) ch.send(`⚠️ 운영 알림\n${msg}`);
+  } catch {}
+}
 
-  await ch.send({
+async function send(title, desc, mention=false) {
+  if (!isStr(desc)) return null;
+  const ch = await client.channels.fetch(CHANNEL_ID);
+  if (!ch) return null;
+
+  return ch.send({
     content: mention ? '@everyone' : undefined,
-    embeds: [new EmbedBuilder().setTitle(title).setDescription(desc).setTimestamp()]
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(title)
+        .setDescription(desc)
+        .setTimestamp()
+    ]
   });
 }
 
@@ -111,65 +142,97 @@ setInterval(() => {
 setInterval(async () => {
   try {
     const { data } = await axios.get(NHK_EEW);
+    apiFail.NHK = 0;
+
     for (const e of data) {
       if (!isStr(e.hypocenter) || !isStr(e.maxint) || !isStr(e.origin_time)) continue;
       const k = key('EEW', e.origin_time, e.hypocenter);
       if (sent.has(k)) continue;
       sent.add(k);
 
-      send(
+      const msg = await send(
         '🇯🇵 NHK 지진 예보(EEW)',
         `위치: ${e.hypocenter}\n예상 최대진도: ${e.maxint}`,
         e.maxint.includes('5')
       );
+
+      if (msg) eewMap.set(k, msg.id);
     }
-  } catch {}
+  } catch {
+    if (++apiFail.NHK === 3) adminAlert('NHK EEW API 3회 연속 실패');
+  }
 }, 15_000);
 
 /* ===== NHK REPORT (30s) ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(NHK_REPORT);
+    apiFail.NHK = 0;
+
+    const ch = await client.channels.fetch(CHANNEL_ID);
+
     for (const e of data) {
       if (!isStr(e.hypocenter) || !isStr(e.magnitude) || !isStr(e.maxint)) continue;
       const k = key('NHK', e.origin_time, e.hypocenter);
       if (sent.has(k)) continue;
       sent.add(k);
 
-      send(
+      const eewKey = key('EEW', e.origin_time, e.hypocenter);
+      if (eewMap.has(eewKey) && ch) {
+        const old = await ch.messages.fetch(eewMap.get(eewKey));
+        await old.reply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle('🔁 예보 → 관측 확정')
+              .setDescription(
+                `위치: ${e.hypocenter}\n규모: ${e.magnitude}\n최대진도: ${e.maxint}`
+              )
+              .setTimestamp()
+          ]
+        });
+        eewMap.delete(eewKey);
+      }
+
+      await send(
         '🇯🇵 NHK 지진 속보',
         `위치: ${e.hypocenter}\n규모: ${e.magnitude}\n최대진도: ${e.maxint}`,
         e.maxint.includes('5')
       );
     }
-  } catch {}
+  } catch {
+    if (++apiFail.NHK === 3) adminAlert('NHK REPORT API 3회 연속 실패');
+  }
 }, 30_000);
 
 /* ===== JMA FAST (45s) ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(JMA_FAST);
-    const now = Date.now();
+    apiFail.JMA = 0;
+
     for (const e of data) {
       if (!isStr(e.place) || !isStr(e.intensity) || !isStr(e.time)) continue;
-      if (now - new Date(e.time).getTime() > 300000) continue;
       const k = key('JMA', e.time, e.place);
       if (sent.has(k)) continue;
       sent.add(k);
 
-      send(
+      await send(
         '🇯🇵 JMA 실시간 지진',
         `위치: ${e.place}\n규모: ${e.magnitude}\n최대진도: ${e.intensity}`,
         e.intensity.includes('5+')
       );
     }
-  } catch {}
+  } catch {
+    if (++apiFail.JMA === 3) adminAlert('JMA API 3회 연속 실패');
+  }
 }, 45_000);
 
 /* ===== KMA (60s) ===== */
 setInterval(async () => {
   try {
     const { data } = await axios.get(KMA_URL);
+    apiFail.KMA = 0;
+
     const items = data?.response?.body?.items?.item || [];
     for (const e of items) {
       if (!isStr(e.eqPlace) || !isStr(e.eqMagnitude) || !isStr(e.maxInten)) continue;
@@ -177,13 +240,15 @@ setInterval(async () => {
       if (sent.has(k)) continue;
       sent.add(k);
 
-      send(
+      await send(
         '🇰🇷 KMA 지진',
         `위치: ${e.eqPlace}\n규모: ${e.eqMagnitude}\n진도: ${e.maxInten}`,
         Number(e.maxInten) >= 4
       );
     }
-  } catch {}
+  } catch {
+    if (++apiFail.KMA === 3) adminAlert('KMA API 3회 연속 실패');
+  }
 }, 60_000);
 
 /* ===== SEOUL EMERGENCY (90s) ===== */
