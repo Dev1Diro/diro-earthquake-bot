@@ -63,6 +63,7 @@ let pingFailures = 0;
 
 /* ===== 임베드 전송 ===== */
 async function sendEmbed(title, desc, color='#FFFF00') {
+    if(!desc) return; // 값 없으면 전송 안 함
     try {
         const channel = await client.channels.fetch(CHANNEL_ID);
         if(!channel) return;
@@ -102,10 +103,11 @@ function startLoop(){
         for(const eq of kmaData){
             const key = `${eq.earthquakeNo||''}-${eq.eqPlace||''}`;
             if(sentKMA.has(key)) continue;
+            if(!eq.eqPlace || !eq.maxInten) continue; // 필수값 없으면 스킵
             if(Number(eq.maxInten)<4) continue;
             sentKMA.add(key);
             const desc = `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`;
-            await sendEmbed('🇰🇷 KMA 지진 🔶', desc, '#FFA500'); // 주황색
+            await sendEmbed('🇰🇷 KMA 지진 🔶', desc, '#FFA500');
         }
         advanceKmaDay();
 
@@ -114,24 +116,27 @@ function startLoop(){
         for(const eq of jmaData){
             const key = `${eq.code||''}-${eq.place||''}`;
             if(sentJMA.has(key)) continue;
+            if(!eq.place || !eq.intensity || !eq.magnitude) continue;
             sentJMA.add(key);
-            const is5Plus = eq.intensity && (eq.intensity.includes('5+') || Number(eq.intensity.replace('+',''))>=5);
+            const is5Plus = eq.intensity.includes('5+');
             let desc = `위치: ${eq.place}\n규모: ${eq.magnitude}\n최대진도: ${eq.intensity}`;
             const title = is5Plus ? '🇯🇵 JMA 지진 🔴' : '🇯🇵 JMA 지진 ⚪';
             if(is5Plus) desc = `@everyone\n${desc}`;
-            await sendEmbed(title, desc, is5Plus ? '#FF0000' : '#FFFFFF'); // 빨강 or 흰색
+            await sendEmbed(title, desc, is5Plus ? '#FF0000' : '#FFFFFF');
         }
 
-        /* 재난문자 */
+        /* 재난문자 (긴급, 위급만) */
         const disasterData = await fetchDisaster();
         for(const d of disasterData){
             const key = `${d.msgNo||''}`;
             if(sentDisaster.has(key)) continue;
+            if(!d.msg) continue; // 메시지 없으면 스킵
             sentDisaster.add(key);
-            let msg = d.msg||'';
-            const color = (d.level==='긴급'||d.level==='최상위') ? '#1E90FF' : '#808080';
-            const title = (d.level==='긴급'||d.level==='최상위') ? `⚠️ 긴급 재난` : `재난 문자`;
-            if(d.level==='긴급'||d.level==='최상위') msg=`@everyone\n${msg}`;
+            const isEmergency = d.level==='긴급'||d.level==='위급';
+            if(!isEmergency) continue;
+            const color = '#1E90FF';
+            const title = '⚠️ 재난 알림';
+            const msg = `@everyone\n${d.msg}`;
             await sendEmbed(title, msg, color);
         }
 
