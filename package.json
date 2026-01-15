@@ -1,18 +1,19 @@
 {
-  "name": "discord-quake-bot",
+  "name": "discord-earthquake-bot",
   "version": "1.0.0",
-  "description": "Discord 지진 알림 봇 (KMA & JMA)",
+  "description": "Discord 지진/재난 알림 봇 (KMA, JMA, 재난문자)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "axios": "^1.6.0",
-    "discord.js": "^14.11.0",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2"
-  },
-  "engines": {
-    "node": "18.x"
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.3.1"
   }
 }

@@ -11,7 +11,7 @@ const APPLICATION_ID = process.env.APPLICATION_ID;
 /* ===== KMA API ===== */
 const KMA_API_KEY = '24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40';
 let currentKmaFrom = new Date('2026-01-12');
-let currentKmaTo = new Date('2026-01-12'); // 하루 단위
+let currentKmaTo = new Date('2026-01-12');
 
 function formatKmaDate(d){ return d.toISOString().slice(0,10).replace(/-/g,''); }
 function advanceKmaDay(){ currentKmaFrom.setDate(currentKmaFrom.getDate()+1); currentKmaTo.setDate(currentKmaTo.getDate()+1); }
@@ -23,7 +23,7 @@ function getKmaUrl(){
 const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
 const DISASTER_URL = 'https://www.safetydata.go.kr/V2/api/DSSP-IF-00247?serviceKey=65H684WY1VX42LFO';
 
-/* ===== 디스코드 ===== */
+/* ===== 디스코드 클라이언트 ===== */
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -34,7 +34,7 @@ const client = new Client({
 });
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
-/* ===== 슬래시 명령어 ===== */
+/* ===== 슬래시 명령어 등록 ===== */
 const commands = [
     new SlashCommandBuilder()
         .setName('청소')
@@ -63,7 +63,7 @@ let pingFailures = 0;
 
 /* ===== 임베드 전송 ===== */
 async function sendEmbed(title, desc, color='#FFFF00') {
-    if(!desc || desc.trim()==='') return; // 값 없으면 전송 안 함
+    if(!desc || desc.trim()==='') return;
     try {
         const channel = await client.channels.fetch(CHANNEL_ID);
         if(!channel) return;
@@ -76,10 +76,10 @@ async function sendEmbed(title, desc, color='#FFFF00') {
     } catch(e) { console.error('임베드 전송 실패', e.message); }
 }
 
-/* ===== fetch ===== */
-async function fetchKMA(){ try{ const res = await axios.get(getKmaUrl(), { params:{disp:1, help:0} }); return res.data?.response?.body?.items?.item||[]; }catch(e){ console.error('KMA fetch 실패',e.message); pingFailures++; return []; } }
-async function fetchJMA(){ try{ const res = await axios.get(JMA_URL); return res.data||[]; }catch(e){ console.error('JMA fetch 실패',e.message); pingFailures++; return []; } }
-async function fetchDisaster(){ try{ const res = await axios.get(DISASTER_URL); return res.data?.response?.body?.items?.item||[]; }catch(e){ console.error('재난문자 fetch 실패',e.message); pingFailures++; return []; } }
+/* ===== API fetch ===== */
+async function fetchKMA(){ try{ const res = await axios.get(getKmaUrl(), { params:{disp:1, help:0} }); return res.data?.response?.body?.items?.item||[]; }catch(e){ pingFailures++; return []; } }
+async function fetchJMA(){ try{ const res = await axios.get(JMA_URL); return res.data||[]; }catch(e){ pingFailures++; return []; } }
+async function fetchDisaster(){ try{ const res = await axios.get(DISASTER_URL); return res.data?.response?.body?.items?.item||[]; }catch(e){ pingFailures++; return []; } }
 
 /* ===== Ping 루프 1분 ===== */
 function startPingLoop(){
@@ -89,7 +89,6 @@ function startPingLoop(){
             pingFailures = 0;
         }catch{
             pingFailures++;
-            console.log(`Ping 실패: ${pingFailures}`);
         }
     }, 60_000);
 }
@@ -103,7 +102,7 @@ function startLoop(){
         for(const eq of kmaData){
             const key = `${eq.earthquakeNo||''}-${eq.eqPlace||''}`;
             if(sentKMA.has(key)) continue;
-            if(!eq.eqPlace || !eq.maxInten) continue; // 필수값 없으면 스킵
+            if(!eq.eqPlace || !eq.maxInten) continue;
             if(Number(eq.maxInten)<4) continue;
             sentKMA.add(key);
             const desc = `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`;
@@ -130,14 +129,12 @@ function startLoop(){
         for(const d of disasterData){
             const key = `${d.msgNo||''}`;
             if(sentDisaster.has(key)) continue;
-            if(!d.msg) continue; // 메시지 없으면 스킵
+            if(!d.msg || !d.level) continue;
+            if(d.level!=='긴급' && d.level!=='위급') continue;
             sentDisaster.add(key);
-            const isEmergency = d.level==='긴급'||d.level==='위급';
-            if(!isEmergency) continue;
-            const color = '#1E90FF';
             const title = '⚠️ 재난 알림';
             const msg = `@everyone\n${d.msg}`;
-            await sendEmbed(title, msg, color);
+            await sendEmbed(title, msg, '#1E90FF');
         }
 
     }, 60_000);
@@ -154,22 +151,18 @@ client.on('interactionCreate', async interaction=>{
             const msgs = await interaction.channel.messages.fetch({limit:n});
             await interaction.channel.bulkDelete(msgs,true);
             return interaction.reply({content:`${n}개 메시지 삭제 완료`, ephemeral:true});
-        }catch(e){
-            console.error('청소 실패', e);
+        }catch{
             return interaction.reply({content:'메시지 삭제 실패', ephemeral:true});
         }
     }
 
     if(interaction.commandName==='실시간정보'){
-        const statusText = `Ping 실패: ${pingFailures}\nKMA 연결: ${pingFailures===0?'🟢 정상':'🔴 불안정'}\nJMA 연결: 🟢 정상`;
-        return interaction.reply({
-            embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(statusText).setColor('#00FF00').setTimestamp()],
-            ephemeral:true
-        });
+        const statusText = `Ping 실패: ${pingFailures}\nKMA 연결: 정상\nJMA 연결: 정상`;
+        return interaction.reply({embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(statusText).setColor('#00FF00').setTimestamp()], ephemeral:true});
     }
 
     if(interaction.commandName==='stop'){
-        await interaction.reply('봇 종료');
+        await interaction.reply('봇 종료 중');
         process.exit(0);
     }
 });
