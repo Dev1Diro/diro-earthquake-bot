@@ -54,38 +54,56 @@ function startPingLoop(){
 function startLoop(){
     setInterval(async()=>{
 
-        /* KMA 4 이상 */
+        /* ===== KMA 지진 ===== */
         const kmaData = await fetchKMA();
         for(const eq of kmaData){
             const key = `${eq.earthquakeNo||''}-${eq.eqPlace||''}`;
             if(sentKMA.has(key)) continue;
             if(!eq.eqPlace || !eq.maxInten) continue;
-            if(Number(eq.maxInten)<4) continue;
+
+            const desc = `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`;
+            const isMent = Number(eq.maxInten) >= 4;
             sentKMA.add(key);
-            await sendEmbed('🇰🇷 KMA 지진 🔶', `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`, '#FFA500');
+
+            await sendEmbed(
+                isMent ? '🇰🇷 KMA 지진 🔶 @everyone' : '🇰🇷 KMA 지진 🔶',
+                isMent ? `@everyone\n${desc}` : desc,
+                '#FFA500'
+            );
         }
 
-        /* JMA 5+ */
+        /* ===== JMA 지진 ===== */
         const jmaData = await fetchJMA();
         for(const eq of jmaData){
             const key = `${eq.code||''}-${eq.place||''}`;
             if(sentJMA.has(key)) continue;
             if(!eq.place || !eq.intensity || !eq.magnitude) continue;
-            const is5Plus = eq.intensity.includes('5+');
-            if(!is5Plus) continue;
+
+            const desc = `위치: ${eq.place}\n규모: ${eq.magnitude}\n최대진도: ${eq.intensity}`;
+            const isMent = eq.intensity.includes('5+'); // 5+ 이상만 멘션
             sentJMA.add(key);
-            await sendEmbed('🇯🇵 JMA 지진 🔴', `@everyone\n위치: ${eq.place}\n규모: ${eq.magnitude}\n최대진도: ${eq.intensity}`, '#FF0000');
+
+            await sendEmbed(
+                isMent ? '🇯🇵 JMA 지진 🔴 @everyone' : '🇯🇵 JMA 지진 🔴',
+                isMent ? `@everyone\n${desc}` : desc,
+                '#FF0000'
+            );
         }
 
-        /* 재난문자 (긴급, 위급만) */
+        /* ===== 재난문자 ===== */
         const disasterData = await fetchDisaster();
         for(const d of disasterData){
             const key = `${d.msgNo||''}`;
             if(sentDisaster.has(key)) continue;
             if(!d.msg || !d.level) continue;
-            if(d.level!=='긴급' && d.level!=='위급') continue;
+            const isMent = d.level==='긴급'||d.level==='위급';
             sentDisaster.add(key);
-            await sendEmbed('⚠️ 재난 알림', `@everyone\n${d.msg}`, '#1E90FF');
+
+            await sendEmbed(
+                isMent ? '⚠️ 재난 알림 @everyone' : '⚠️ 재난 알림',
+                isMent ? `@everyone\n${d.msg}` : d.msg,
+                '#1E90FF'
+            );
         }
 
     }, 20_000);
@@ -111,7 +129,7 @@ client.on('interactionCreate', async interaction=>{
 
     if(cmd==='청소'){
         const n = interaction.options.getInteger('수량');
-        if(n<1 || n>100) return interaction.reply({content:'1~100만 가능합니다.', ephemeral:true});
+        if(n<1||n>100) return interaction.reply({content:'1~100만 가능합니다.', ephemeral:true});
         try{
             const msgs = await interaction.channel.messages.fetch({limit:n});
             await interaction.channel.bulkDelete(msgs,true);
