@@ -23,6 +23,13 @@ let sentJMA = new Set();
 let sentDisaster = new Set();
 let pingFailures = 0;
 
+/* ===== 안전하게 문자열 변환 ===== */
+function safeStr(value) {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+}
+
 /* ===== 임베드 전송 ===== */
 async function sendEmbed(title, desc, color='#FFFF00') {
     if(!desc || desc.trim()==='') return;
@@ -57,11 +64,15 @@ function startLoop(){
         /* ===== KMA 지진 ===== */
         const kmaData = await fetchKMA();
         for(const eq of kmaData){
-            const key = `${eq.earthquakeNo||''}-${eq.eqPlace||''}`;
+            const key = `${safeStr(eq.earthquakeNo)}-${safeStr(eq.eqPlace)}`;
             if(sentKMA.has(key)) continue;
             if(!eq.eqPlace || !eq.maxInten) continue;
 
-            const desc = `위치: ${eq.eqPlace}\n규모: ${eq.eqMagnitude||'정보없음'}\n진도: ${eq.maxInten}`;
+            const place = safeStr(eq.eqPlace);
+            const magnitude = safeStr(eq.eqMagnitude || '정보없음');
+            const intensity = safeStr(eq.maxInten);
+            const desc = `위치: ${place}\n규모: ${magnitude}\n진도: ${intensity}`;
+
             const isMent = Number(eq.maxInten) >= 4;
             sentKMA.add(key);
 
@@ -75,11 +86,15 @@ function startLoop(){
         /* ===== JMA 지진 ===== */
         const jmaData = await fetchJMA();
         for(const eq of jmaData){
-            const key = `${eq.code||''}-${eq.place||''}`;
+            const key = `${safeStr(eq.code)}-${safeStr(eq.place)}`;
             if(sentJMA.has(key)) continue;
             if(!eq.place || !eq.intensity || !eq.magnitude) continue;
 
-            const desc = `위치: ${eq.place}\n규모: ${eq.magnitude}\n최대진도: ${eq.intensity}`;
+            const place = safeStr(eq.place);
+            const magnitude = safeStr(eq.magnitude);
+            const intensity = safeStr(eq.intensity);
+            const desc = `위치: ${place}\n규모: ${magnitude}\n최대진도: ${intensity}`;
+
             const isMent = eq.intensity.includes('5+'); // 5+ 이상만 멘션
             sentJMA.add(key);
 
@@ -93,15 +108,17 @@ function startLoop(){
         /* ===== 재난문자 ===== */
         const disasterData = await fetchDisaster();
         for(const d of disasterData){
-            const key = `${d.msgNo||''}`;
+            const key = `${safeStr(d.msgNo)}`;
             if(sentDisaster.has(key)) continue;
             if(!d.msg || !d.level) continue;
+
+            const msg = safeStr(d.msg);
             const isMent = d.level==='긴급'||d.level==='위급';
             sentDisaster.add(key);
 
             await sendEmbed(
                 isMent ? '⚠️ 재난 알림 @everyone' : '⚠️ 재난 알림',
-                isMent ? `@everyone\n${d.msg}` : d.msg,
+                isMent ? `@everyone\n${msg}` : msg,
                 '#1E90FF'
             );
         }
