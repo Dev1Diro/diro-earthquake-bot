@@ -63,7 +63,7 @@ let pingFailures = 0;
 
 /* ===== 임베드 전송 ===== */
 async function sendEmbed(title, desc, color='#FFFF00') {
-    if(!desc) return; // 값 없으면 전송 안 함
+    if(!desc || desc.trim()==='') return; // 값 없으면 전송 안 함
     try {
         const channel = await client.channels.fetch(CHANNEL_ID);
         if(!channel) return;
@@ -161,8 +161,11 @@ client.on('interactionCreate', async interaction=>{
     }
 
     if(interaction.commandName==='실시간정보'){
-        const status = `Ping 실패: ${pingFailures}\nKMA/JMA 연결: ${pingFailures===0?'🟢 정상':'🔴 불안정'}`;
-        return interaction.reply({embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(status).setTimestamp()], ephemeral:true});
+        const statusText = `Ping 실패: ${pingFailures}\nKMA 연결: ${pingFailures===0?'🟢 정상':'🔴 불안정'}\nJMA 연결: 🟢 정상`;
+        return interaction.reply({
+            embeds:[new EmbedBuilder().setTitle('실시간 정보').setDescription(statusText).setColor('#00FF00').setTimestamp()],
+            ephemeral:true
+        });
     }
 
     if(interaction.commandName==='stop'){
