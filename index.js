@@ -1,198 +1,145 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, Routes } = require('discord.js');
+const { REST } = require('@discordjs/rest');
 const axios = require('axios');
-const express = require('express');
 
-// ================= 환경변수 =================
 const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const KMA_KEY = process.env.KMA_KEY;
-const JMA_KEY = process.env.JMA_API_KEY;
-const DISASTER_KEY = process.env.DISASTER_KEY;
 const PORT = process.env.PORT || 3000;
 
-// ================= Discord Client =================
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-  partials: [Partials.Channel],
-});
-
-let pingerOK = false;
-let KMA_OK = false;
-let JMA_OK = false;
-let disasterOK = false;
-let stopFlag = false;
-
-// ================= KMA 날짜 자동 갱신 =================
-let kmaFromDate = new Date(); // 오늘 기준
-let kmaToDate = new Date(kmaFromDate);
-kmaToDate.setDate(kmaFromDate.getDate() + 1);
-
-function formatDateYMD(date) {
-  return date.toISOString().slice(0,10).replace(/-/g,''); // YYYYMMDD
-}
-
-// ================= KMA/JMA/재난문자 API =================
-async function fetchKMA() {
-  try {
-    const fromTmFc = formatDateYMD(kmaFromDate);
-    const toTmFc = formatDateYMD(kmaToDate);
-    const url = `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40&numOfRows=10&pageNo=1&fromTmFc=20260112&toTmFc=20260115`;
-    const res = await axios.get(url, {
-      params: {
-        serviceKey: KMA_KEY,
-        numOfRows: 10,
-        pageNo: 1,
-        fromTmFc,
-        toTmFc,
-        dataType: 'JSON'
-      },
-      timeout: 15000
-    });
-    KMA_OK = true;
-    // 날짜 갱신: 다음 날
-    const today = new Date();
-    if (kmaToDate <= today) {
-      kmaFromDate.setDate(kmaFromDate.getDate() + 1);
-      kmaToDate.setDate(kmaToDate.getDate() + 1);
-    }
-    return res.data?.response?.body?.items?.item || [];
-  } catch(e) {
-    KMA_OK = false;
-    console.error("KMA fetch failed:", e.message);
-    return [];
-  }
-}
-
-async function fetchJMA() {
-  try {
-    const res = await axios.get('https://www.jma.go.jp/bosai/quake/data/list.json', {
-      headers: { 'Authorization': `Bearer ${JMA_KEY}` },
-      timeout: 15000
-    });
-    JMA_OK = true;
-    return res.data?.items || [];
-  } catch(e) {
-    JMA_OK = false;
-    console.error("JMA fetch failed:", e.message);
-    return [];
-  }
-}
-
+const KMA_URL = `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=${process.env.KMA_API_KEY}&numOfRows=10&pageNo=1`;
+const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
 const DISASTER_URL = 'https://www.safetydata.go.kr//V2/api/DSSP-IF-00247?serviceKey=65H684WY1VX42LFO';
-async function fetchDisaster() {
-  try {
-    const r = await axios.get(DISASTER_URL, {
-      params: { serviceKey: DISASTER_KEY, returnType: 'JSON' },
-      timeout: 15000
-    });
-    disasterOK = true;
-    return r.data?.body?.items || [];
-  } catch(e) {
-    disasterOK = false;
-    console.error("Disaster fetch failed:", e.message);
-    return [];
-  }
+
+let fromTmFc = process.env.KMA_FROM || '20260114';
+let toTmFc = process.env.KMA_TO || '20260115';
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+// 슬래쉬 커맨드 등록
+const commands = [
+    new SlashCommandBuilder().setName('stop').setDescription('봇 종료'),
+    new SlashCommandBuilder().setName('실시간정보').setDescription('봇 실시간 상태 조회'),
+].map(cmd => cmd.toJSON());
+
+const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+async function registerCommands() {
+    await rest.put(Routes.applicationCommands(process.env.APPLICATION_ID), { body: commands });
 }
 
-// ================= Discord 전송 =================
-async function sendEmbed(title, description) {
-  if (!CHANNEL_ID) return;
-  try {
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel) return;
-    const embed = new EmbedBuilder()
-      .setTitle(title)
-      .setDescription(description)
-      .setTimestamp(new Date());
-    await channel.send({ embeds: [embed] });
-  } catch(e) {
-    console.error("Embed send failed:", e.message);
-  }
+client.once('ready', () => {
+    console.log(`${client.user.tag} 봇 준비 완료`);
+    startPingLoop();
+    startKmaJmaLoop();
+    startDisasterLoop();
+});
+
+// ===== Pinger 1분 =====
+let pingFailures = 0;
+function startPingLoop() {
+    setInterval(async () => {
+        try {
+            await axios.get('https://www.google.com'); // 단순 ping
+            console.log('Ping 성공');
+            pingFailures = 0;
+        } catch {
+            pingFailures++;
+            console.log(`Ping 실패 시도 ${pingFailures}`);
+        }
+    }, 60_000);
 }
 
-// ================= Pinger =================
-async function pingLoop() {
-  while(!stopFlag) {
+// ===== KMA 지진 조회 20초 =====
+async function fetchKMA() {
     try {
-      await client.user.setActivity('실시간 지진 정보', { type: 3 });
-      pingerOK = true;
-      console.log(`[Pinger] 정상작동: ${new Date().toLocaleTimeString()}`);
-    } catch {
-      pingerOK = false;
+        const url = `${KMA_URL}&fromTmFc=${fromTmFc}&toTmFc=${toTmFc}`;
+        const res = await axios.get(url, { params: { disp: 1, help: 0 } });
+        return res.data?.response?.body?.items?.item || [];
+    } catch(e) {
+        console.error('KMA fetch 실패:', e.message);
+        return [];
     }
-    await new Promise(r=>setTimeout(r, 60_000));
-  }
 }
 
-// ================= 조회 루프 =================
-async function checkLoop() {
-  while(!stopFlag) {
-    const kma = await fetchKMA();
-    const jma = await fetchJMA();
-    const disaster = await fetchDisaster();
-
-    const events = [];
-    kma?.forEach(i => events.push(`[KMA] ${i.title || i}`));
-    jma?.forEach(i => events.push(`[JMA] ${i.title || i}`));
-    disaster?.forEach(i => {
-      const level = i.alarmLevel || '';
-      const title = level.includes('위급') ? `@everyone ${i.title}` : i.title;
-      events.push(`[DISASTER] ${title}\n${i.contents}`);
-    });
-
-    for (const ev of events) {
-      await sendEmbed('실시간 정보', ev);
+// ===== JMA 지진 조회 =====
+async function fetchJMA() {
+    try {
+        const res = await axios.get(JMA_URL);
+        return res.data || [];
+    } catch(e) {
+        console.error('JMA fetch 실패:', e.message);
+        return [];
     }
-
-    await new Promise(r=>setTimeout(r, 20_000));
-  }
 }
 
-// ================= 슬래쉬 명령어 =================
+// ===== 재난문자 조회 =====
+async function fetchDisaster() {
+    try {
+        const res = await axios.get(DISASTER_URL);
+        return res.data?.response?.body?.items?.item || [];
+    } catch(e) {
+        console.error('재난문자 fetch 실패:', e.message);
+        return [];
+    }
+}
+
+// ===== 임베드 메시지 전송 =====
+async function sendEmbed(title, description) {
+    try {
+        const channel = await client.channels.fetch(CHANNEL_ID);
+        if(!channel) return;
+        const embed = new EmbedBuilder().setTitle(title).setDescription(description).setTimestamp();
+        await channel.send({ embeds: [embed] });
+    } catch(e) {
+        console.error('임베드 전송 실패:', e.message);
+    }
+}
+
+// ===== 지진 조회 루프 20초 =====
+function startKmaJmaLoop() {
+    setInterval(async () => {
+        const kmaData = await fetchKMA();
+        const jmaData = await fetchJMA();
+        // 최근 지진 있으면 임베드 전송
+        if(kmaData.length) await sendEmbed('KMA 지진 알림', JSON.stringify(kmaData[0]));
+        if(jmaData.length) await sendEmbed('JMA 지진 알림', JSON.stringify(jmaData[0]));
+        // 하루 지나면 날짜 1일씩 이동
+        const today = new Date();
+        if(today.getDate() !== parseInt(fromTmFc.slice(6,8))) {
+            const nextDate = new Date(today);
+            fromTmFc = nextDate.toISOString().slice(0,10).replace(/-/g,'');
+            toTmFc = new Date(nextDate.getTime() + 24*60*60*1000).toISOString().slice(0,10).replace(/-/g,'');
+        }
+    }, 20_000);
+}
+
+// ===== 재난문자 루프 20초 =====
+function startDisasterLoop() {
+    setInterval(async () => {
+        const data = await fetchDisaster();
+        if(data.length) {
+            for(const item of data) {
+                let title = item.msgTitle || '재난 문자';
+                let desc = item.msg || '';
+                await sendEmbed(title, desc);
+            }
+        }
+    }, 20_000);
+}
+
+// ===== 슬래쉬 명령어 처리 =====
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === 'stop') {
-    stopFlag = true;
-    await interaction.reply('봇 작동 중지됨.');
-    process.exit(0);
-  }
-  if (interaction.commandName === '실시간정보') {
-    const embed = new EmbedBuilder()
-      .setTitle('실시간 상태')
-      .addFields(
-        { name: 'Pinger', value: pingerOK ? '🟢 정상' : '🔴 실패', inline: true },
-        { name: 'KMA 연결', value: KMA_OK ? '🟢 정상' : '🔴 실패', inline: true },
-        { name: 'JMA 연결', value: JMA_OK ? '🟢 정상' : '🔴 실패', inline: true },
-        { name: '재난문자 연결', value: disasterOK ? '🟢 정상' : '🔴 실패', inline: true }
-      )
-      .setTimestamp(new Date());
-    await interaction.reply({ embeds: [embed] });
-  }
+    if(!interaction.isCommand()) return;
+    if(interaction.commandName === 'stop') {
+        await interaction.reply('봇 종료 중...');
+        process.exit(0);
+    }
+    if(interaction.commandName === '실시간정보') {
+        const status = `핑 실패: ${pingFailures}\nKMA 연결: ${pingFailures===0?'🟢':'🔴'}\nJMA 연결: 🟢`;
+        await interaction.reply({ embeds: [new EmbedBuilder().setTitle('실시간 정보').setDescription(status).setTimestamp()] });
+    }
 });
 
-// ================= 슬래쉬 명령어 등록 =================
-client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  try {
-    await rest.put(
-      Routes.applicationCommands(client.user.id),
-      { body: [
-        { name: 'stop', description: '봇 작동 중지' },
-        { name: '실시간정보', description: '현재 상태 확인' }
-      ] }
-    );
-    console.log('슬래쉬 명령어 등록 완료');
-  } catch(e) { console.error(e); }
-
-  pingLoop();
-  checkLoop();
-});
-
-client.login(TOKEN).catch(e=>console.error("Discord login failed:", e.message));
-
-// ================= 서버 포트 바인딩 (Render용) =================
-const app = express();
-app.get('/', (req,res)=>res.send('봇 실행중'));
-app.listen(PORT, ()=>console.log(`서버 포트 ${PORT} 바인딩 완료`));
+registerCommands().catch(console.error);
+client.login(TOKEN);
