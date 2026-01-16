@@ -1,12 +1,3 @@
-/*************************************************
- * Earthquake & Disaster Alert Discord Bot
- * FINAL PRODUCTION VERSION
- * - KMA (Korea)
- * - JMA (Japan)
- * - Emergency Disaster Message (MOIS)
- * - Render Free compatible
- *************************************************/
-
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes } = require('discord.js');
 const axios = require('axios');
@@ -20,8 +11,10 @@ const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const APPLICATION_ID = process.env.APPLICATION_ID;
 const DISASTER_KEY = process.env.DISASTER_API_KEY;
 
+const ADMIN_USER_ID = '1160812272369807360';
+
 /* =========================
-   EXPRESS (PORT BINDING)
+   EXPRESS (Render keepalive)
 ========================= */
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,7 +22,7 @@ app.get('/', (_, res) => res.send('OK'));
 app.listen(PORT);
 
 /* =========================
-   API ENDPOINTS
+   API URL
 ========================= */
 const KMA_URL =
   'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg' +
@@ -40,7 +33,7 @@ const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
 
 const DISASTER_URL =
   'https://apis.data.go.kr/1741000/DisasterMsg2/getDisasterMsgList' +
-  '?numOfRows=10&pageNo=1&type=json';
+  '?numOfRows=50&pageNo=1&type=json';
 
 /* =========================
    GLOBAL STATE
@@ -58,27 +51,27 @@ const state = {
 };
 
 /* =========================
-   DISCORD CLIENT
+   DISCORD
 ========================= */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
 /* =========================
-   TIME (KST SAFE)
+   TIME (KST)
 ========================= */
-function kst(d = new Date()) {
-  return new Date(d.getTime() + 9 * 3600000);
+function kstNow() {
+  return new Date(Date.now() + 9 * 3600000);
 }
-function ymd(d = new Date()) {
-  return kst(d).toISOString().slice(0, 10).replace(/-/g, '');
+function ymd(d = kstNow()) {
+  return d.toISOString().slice(0, 10).replace(/-/g, '');
 }
 function daysAgo(n) {
   return ymd(new Date(Date.now() - n * 86400000));
 }
 
 /* =========================
-   SAFE HTTP
+   HTTP SAFE
 ========================= */
 async function safeGet(url, params = {}) {
   try {
@@ -90,7 +83,7 @@ async function safeGet(url, params = {}) {
 }
 
 /* =========================
-   FETCH: KMA
+   FETCH KMA
 ========================= */
 async function fetchKMA() {
   const data = await safeGet(KMA_URL, {
@@ -109,7 +102,7 @@ async function fetchKMA() {
 }
 
 /* =========================
-   FETCH: JMA
+   FETCH JMA
 ========================= */
 async function fetchJMA() {
   const data = await safeGet(JMA_URL);
@@ -123,38 +116,36 @@ async function fetchJMA() {
 }
 
 /* =========================
-   FETCH: DISASTER MSG
+   FETCH DISASTER (전국 병합)
 ========================= */
 async function fetchDisaster() {
   const data = await safeGet(DISASTER_URL, {
     serviceKey: DISASTER_KEY
   });
 
-  const items = data?.DisasterMsg?.[1]?.row;
-  if (!Array.isArray(items)) {
+  const rows = data?.DisasterMsg?.[1]?.row;
+  if (!Array.isArray(rows)) {
     state.disaster.ok = false;
     state.disaster.fail++;
     return [];
   }
   state.disaster.ok = true;
-  return items;
+  return rows;
 }
 
 /* =========================
    DISCORD SEND
 ========================= */
 async function send(embed, everyone = false) {
-  try {
-    const ch = await client.channels.fetch(CHANNEL_ID);
-    await ch.send({
-      content: everyone ? '@everyone' : undefined,
-      embeds: [embed]
-    });
-  } catch {}
+  const ch = await client.channels.fetch(CHANNEL_ID);
+  await ch.send({
+    content: everyone ? '@everyone' : undefined,
+    embeds: [embed]
+  });
 }
 
 /* =========================
-   HANDLE KMA
+   HANDLERS
 ========================= */
 async function handleKMA() {
   for (const e of await fetchKMA()) {
@@ -173,9 +164,6 @@ async function handleKMA() {
   }
 }
 
-/* =========================
-   HANDLE JMA
-========================= */
 async function handleJMA() {
   const now = Date.now();
   for (const e of await fetchJMA()) {
@@ -197,9 +185,6 @@ async function handleJMA() {
   }
 }
 
-/* =========================
-   HANDLE DISASTER
-========================= */
 async function handleDisaster() {
   for (const e of await fetchDisaster()) {
     if (!e.md101_sn || state.sent.disaster.has(e.md101_sn)) continue;
@@ -237,16 +222,22 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 (async () => {
-  try {
-    await rest.put(
-      Routes.applicationCommands(APPLICATION_ID),
-      { body: commands }
-    );
-  } catch {}
+  await rest.put(
+    Routes.applicationCommands(APPLICATION_ID),
+    { body: commands }
+  );
 })();
 
+/* =========================
+   INTERACTION
+========================= */
 client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
+
+  if (i.user.id !== ADMIN_USER_ID) {
+    await i.reply({ content: '권한 없음', ephemeral: true });
+    return;
+  }
 
   if (i.commandName === 'stop') {
     await i.reply('봇 종료');
