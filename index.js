@@ -1,128 +1,252 @@
-const {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  PermissionFlagsBits
-} = require('discord.js');
-const axios = require('axios');
-const cheerio = require('cheerio');
+/*************************************************
+ * Earthquake & Disaster Alert Discord Bot
+ * FINAL PRODUCTION VERSION
+ * - KMA (Korea)
+ * - JMA (Japan)
+ * - Emergency Disaster Message (MOIS)
+ * - Render Free compatible
+ *************************************************/
 
-/* ===== ENV ===== */
+require('dotenv').config();
+const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes } = require('discord.js');
+const axios = require('axios');
+const express = require('express');
+
+/* =========================
+   ENV
+========================= */
 const TOKEN = process.env.TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const ADMIN_CHANNEL_ID = process.env.ADMIN_CHANNEL_ID;
 const APPLICATION_ID = process.env.APPLICATION_ID;
+const DISASTER_KEY = process.env.DISASTER_API_KEY;
 
-/* ===== CLIENT ===== */
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-});
+/* =========================
+   EXPRESS (PORT BINDING)
+========================= */
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (_, res) => res.send('OK'));
+app.listen(PORT);
 
-/* ===== ERROR SAFETY + DEBUG ===== */
-client.on('error', err => {
-  console.error('[DISCORD ERROR]', err);
-  adminAlert(`Discord error\n${err.message}`);
-});
-
-process.on('unhandledRejection', err => {
-  console.error('[UNHANDLED REJECTION]', err?.rawError?.errors || err);
-  adminAlert(`UnhandledRejection\n${err}`);
-});
-
-process.on('uncaughtException', err => {
-  console.error('[UNCAUGHT EXCEPTION]', err);
-  adminAlert(`UncaughtException\n${err}`);
-});
-
-/* ===== URL ===== */
-const NHK_EEW = 'https://www3.nhk.or.jp/sokuho/jishin/data/JishinEEW.json';
-const NHK_REPORT = 'https://www3.nhk.or.jp/sokuho/jishin/data/JishinReport.json';
-const JMA_FAST = 'https://www.jma.go.jp/bosai/quake/data/earthquake_recent.json';
-
+/* =========================
+   API ENDPOINTS
+========================= */
 const KMA_URL =
-'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg' +
-'?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40' +
-'&numOfRows=10&pageNo=1&fromTmFc=20260115&toTmFc=20270115';
+  'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg' +
+  '?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40' +
+  '&numOfRows=10&pageNo=1&dataType=JSON';
 
-const SEOUL_EMER =
-'https://news.seoul.go.kr/safety/archives/category/emergency';
+const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
 
-/* ===== STATE ===== */
-const sent = new Set();
-const eewMap = new Map();
-const apiFail = { NHK: 0, JMA: 0, KMA: 0 };
+const DISASTER_URL =
+  'https://apis.data.go.kr/1741000/DisasterMsg2/getDisasterMsgList' +
+  '?numOfRows=10&pageNo=1&type=json';
 
-/* ===== UTIL ===== */
-const isStr = v => typeof v === 'string' && v.trim() !== '';
-const key = (...v) => v.join('|');
+/* =========================
+   GLOBAL STATE
+========================= */
+const state = {
+  running: true,
+  kma: { ok: false, fail: 0 },
+  jma: { ok: false, fail: 0 },
+  disaster: { ok: false, fail: 0 },
+  sent: {
+    kma: new Set(),
+    jma: new Set(),
+    disaster: new Set()
+  }
+};
 
-async function adminAlert(msg) {
+/* =========================
+   DISCORD CLIENT
+========================= */
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+/* =========================
+   TIME (KST SAFE)
+========================= */
+function kst(d = new Date()) {
+  return new Date(d.getTime() + 9 * 3600000);
+}
+function ymd(d = new Date()) {
+  return kst(d).toISOString().slice(0, 10).replace(/-/g, '');
+}
+function daysAgo(n) {
+  return ymd(new Date(Date.now() - n * 86400000));
+}
+
+/* =========================
+   SAFE HTTP
+========================= */
+async function safeGet(url, params = {}) {
   try {
-    const ch = await client.channels.fetch(ADMIN_CHANNEL_ID);
-    if (ch) ch.send(`⚠️ 운영 알림\n${msg}`);
+    const res = await axios.get(url, { params, timeout: 5000 });
+    return res.data;
+  } catch {
+    return null;
+  }
+}
+
+/* =========================
+   FETCH: KMA
+========================= */
+async function fetchKMA() {
+  const data = await safeGet(KMA_URL, {
+    fromTmFc: daysAgo(3),
+    toTmFc: ymd()
+  });
+
+  const items = data?.response?.body?.items?.item;
+  if (!Array.isArray(items)) {
+    state.kma.ok = false;
+    state.kma.fail++;
+    return [];
+  }
+  state.kma.ok = true;
+  return items;
+}
+
+/* =========================
+   FETCH: JMA
+========================= */
+async function fetchJMA() {
+  const data = await safeGet(JMA_URL);
+  if (!Array.isArray(data)) {
+    state.jma.ok = false;
+    state.jma.fail++;
+    return [];
+  }
+  state.jma.ok = true;
+  return data;
+}
+
+/* =========================
+   FETCH: DISASTER MSG
+========================= */
+async function fetchDisaster() {
+  const data = await safeGet(DISASTER_URL, {
+    serviceKey: DISASTER_KEY
+  });
+
+  const items = data?.DisasterMsg?.[1]?.row;
+  if (!Array.isArray(items)) {
+    state.disaster.ok = false;
+    state.disaster.fail++;
+    return [];
+  }
+  state.disaster.ok = true;
+  return items;
+}
+
+/* =========================
+   DISCORD SEND
+========================= */
+async function send(embed, everyone = false) {
+  try {
+    const ch = await client.channels.fetch(CHANNEL_ID);
+    await ch.send({
+      content: everyone ? '@everyone' : undefined,
+      embeds: [embed]
+    });
   } catch {}
 }
 
-/* ===== SAFE SEND (중요) ===== */
-async function send(title, desc, mention=false) {
-  if (!isStr(desc)) return null;
+/* =========================
+   HANDLE KMA
+========================= */
+async function handleKMA() {
+  for (const e of await fetchKMA()) {
+    if (!e.eqkNo || state.sent.kma.has(e.eqkNo)) continue;
+    state.sent.kma.add(e.eqkNo);
 
-  const ch = await client.channels.fetch(CHANNEL_ID);
-  if (!ch) return null;
+    const mag = Number(e.mag || 0);
+    const embed = new EmbedBuilder()
+      .setTitle('지진 정보')
+      .setDescription(
+        `📍 ${e.loc}\n🕒 ${e.tmEqk}\n📏 규모 ${mag}\n${e.rem || ''}`
+      )
+      .setFooter({ text: '출처: 기상청(KMA)' });
 
-  const payload = {
-    embeds: [
-      new EmbedBuilder()
-        .setTitle(String(title).slice(0, 256))
-        .setDescription(String(desc).slice(0, 4000))
-        .setTimestamp()
-    ]
-  };
-
-  if (mention === true) {
-    payload.content = '@everyone';
+    await send(embed, mag >= 4.0);
   }
-
-  return ch.send(payload);
 }
 
-/* ===== SLASH COMMANDS ===== */
-const commands = [
-  new SlashCommandBuilder()
-    .setName('stop')
-    .setDescription('봇 종료'),
+/* =========================
+   HANDLE JMA
+========================= */
+async function handleJMA() {
+  const now = Date.now();
+  for (const e of await fetchJMA()) {
+    const t = new Date(e.time).getTime();
+    if (!t || now - t > 10 * 60 * 1000) continue;
 
-  new SlashCommandBuilder()
-    .setName('청소')
-    .setDescription('메시지 삭제')
-    .addIntegerOption(o =>
-      o.setName('수량')
-       .setDescription('1~100')
-       .setRequired(true)
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
-].map(c => c.toJSON());
+    const id = `${e.time}_${e.lat}_${e.lon}`;
+    if (state.sent.jma.has(id)) continue;
+    state.sent.jma.add(id);
+
+    const embed = new EmbedBuilder()
+      .setTitle('일본 지진 감지')
+      .setDescription(
+        `📍 ${e.place || '일본 인근'}\n🕒 ${e.time}\n📏 규모 ${e.mag}`
+      )
+      .setFooter({ text: '출처: 일본기상청(JMA)' });
+
+    await send(embed, false);
+  }
+}
+
+/* =========================
+   HANDLE DISASTER
+========================= */
+async function handleDisaster() {
+  for (const e of await fetchDisaster()) {
+    if (!e.md101_sn || state.sent.disaster.has(e.md101_sn)) continue;
+    state.sent.disaster.add(e.md101_sn);
+
+    const embed = new EmbedBuilder()
+      .setTitle('긴급재난문자')
+      .setDescription(
+        `📍 ${e.location_name}\n🕒 ${e.create_date}\n\n${e.msg}`
+      )
+      .setFooter({ text: '출처: 행정안전부' });
+
+    await send(embed, true);
+  }
+}
+
+/* =========================
+   SCHEDULER (1 MIN)
+========================= */
+setInterval(async () => {
+  if (!state.running) return;
+  await handleKMA();
+  await handleJMA();
+  await handleDisaster();
+}, 60_000);
+
+/* =========================
+   SLASH COMMANDS (GLOBAL)
+========================= */
+const commands = [
+  { name: 'stop', description: '봇 즉시 종료' },
+  { name: '청소', description: '모든 캐시 초기화' },
+  { name: '실시간정보', description: '시스템 상태 확인' }
+];
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
+(async () => {
+  try {
+    await rest.put(
+      Routes.applicationCommands(APPLICATION_ID),
+      { body: commands }
+    );
+  } catch {}
+})();
 
-client.once('ready', async () => {
-  await rest.put(
-    Routes.applicationCommands(APPLICATION_ID),
-    { body: commands }
-  );
-  console.log('봇 온라인');
-});
-
-/* ===== COMMAND HANDLER ===== */
 client.on('interactionCreate', async i => {
-  if (!i.isCommand()) return;
+  if (!i.isChatInputCommand()) return;
 
   if (i.commandName === 'stop') {
     await i.reply('봇 종료');
@@ -130,150 +254,26 @@ client.on('interactionCreate', async i => {
   }
 
   if (i.commandName === '청소') {
-    const n = i.options.getInteger('수량');
-    if (n < 1 || n > 100) {
-      return i.reply({ content: '1~100만 가능', ephemeral: true });
-    }
-    const msgs = await i.channel.messages.fetch({ limit: n });
-    await i.channel.bulkDelete(msgs, true);
-    await i.reply({ content: `${msgs.size}개 삭제`, ephemeral: true });
+    Object.values(state.sent).forEach(s => s.clear());
+    await i.reply('캐시 초기화 완료');
+  }
+
+  if (i.commandName === '실시간정보') {
+    const embed = new EmbedBuilder()
+      .setTitle('실시간 상태')
+      .setDescription(
+        `KMA ${state.kma.ok ? '🟢' : '🔴'} (fail ${state.kma.fail})\n` +
+        `JMA ${state.jma.ok ? '🟢' : '🔴'} (fail ${state.jma.fail})\n` +
+        `재난문자 ${state.disaster.ok ? '🟢' : '🔴'} (fail ${state.disaster.fail})`
+      );
+    await i.reply({ embeds: [embed] });
   }
 });
 
-/* ===== PING ===== */
-setInterval(() => {
-  axios.get('https://www.google.com').catch(()=>{});
-}, 60_000);
-
-/* ===== NHK EEW ===== */
-setInterval(async () => {
-  try {
-    const { data } = await axios.get(NHK_EEW);
-    apiFail.NHK = 0;
-
-    for (const e of data) {
-      if (!isStr(e.hypocenter) || !isStr(e.maxint) || !isStr(e.origin_time)) continue;
-      const k = key('EEW', e.origin_time, e.hypocenter);
-      if (sent.has(k)) continue;
-      sent.add(k);
-
-      const msg = await send(
-        '🇯🇵 NHK 지진 예보(EEW)',
-        `위치: ${e.hypocenter}\n예상 최대진도: ${e.maxint}`,
-        e.maxint.includes('5')
-      );
-
-      if (msg) eewMap.set(k, msg.id);
-    }
-  } catch {
-    if (++apiFail.NHK === 3) adminAlert('NHK EEW API 3회 연속 실패');
-  }
-}, 15_000);
-
-/* ===== NHK REPORT ===== */
-setInterval(async () => {
-  try {
-    const { data } = await axios.get(NHK_REPORT);
-    apiFail.NHK = 0;
-
-    const ch = await client.channels.fetch(CHANNEL_ID);
-
-    for (const e of data) {
-      if (!isStr(e.hypocenter) || !isStr(e.magnitude) || !isStr(e.maxint)) continue;
-      const k = key('NHK', e.origin_time, e.hypocenter);
-      if (sent.has(k)) continue;
-      sent.add(k);
-
-      const eewKey = key('EEW', e.origin_time, e.hypocenter);
-      if (eewMap.has(eewKey) && ch) {
-        const old = await ch.messages.fetch(eewMap.get(eewKey));
-        await old.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle('🔁 예보 → 관측 확정')
-              .setDescription(
-                `위치: ${e.hypocenter}\n규모: ${e.magnitude}\n최대진도: ${e.maxint}`
-              )
-              .setTimestamp()
-          ]
-        });
-        eewMap.delete(eewKey);
-      }
-
-      await send(
-        '🇯🇵 NHK 지진 속보',
-        `위치: ${e.hypocenter}\n규모: ${e.magnitude}\n최대진도: ${e.maxint}`,
-        e.maxint.includes('5')
-      );
-    }
-  } catch {
-    if (++apiFail.NHK === 3) adminAlert('NHK REPORT API 3회 연속 실패');
-  }
-}, 30_000);
-
-/* ===== JMA ===== */
-setInterval(async () => {
-  try {
-    const { data } = await axios.get(JMA_FAST);
-    apiFail.JMA = 0;
-
-    for (const e of data) {
-      if (!isStr(e.place) || !isStr(e.intensity) || !isStr(e.time)) continue;
-      const k = key('JMA', e.time, e.place);
-      if (sent.has(k)) continue;
-      sent.add(k);
-
-      await send(
-        '🇯🇵 JMA 실시간 지진',
-        `위치: ${e.place}\n규모: ${e.magnitude}\n최대진도: ${e.intensity}`,
-        e.intensity.includes('5+')
-      );
-    }
-  } catch {
-    if (++apiFail.JMA === 3) adminAlert('JMA API 3회 연속 실패');
-  }
-}, 45_000);
-
-/* ===== KMA ===== */
-setInterval(async () => {
-  try {
-    const { data } = await axios.get(KMA_URL);
-    apiFail.KMA = 0;
-
-    const items = data?.response?.body?.items?.item || [];
-    for (const e of items) {
-      if (!isStr(e.eqPlace) || !isStr(e.eqMagnitude) || !isStr(e.maxInten)) continue;
-      const k = key('KMA', e.earthquakeNo);
-      if (sent.has(k)) continue;
-      sent.add(k);
-
-      await send(
-        '🇰🇷 KMA 지진',
-        `위치: ${e.eqPlace}\n규모: ${e.eqMagnitude}\n진도: ${e.maxInten}`,
-        Number(e.maxInten) >= 4
-      );
-    }
-  } catch {
-    if (++apiFail.KMA === 3) adminAlert('KMA API 3회 연속 실패');
-  }
-}, 60_000);
-
-/* ===== SEOUL ===== */
-setInterval(async () => {
-  try {
-    const html = await axios.get(SEOUL_EMER);
-    const $ = cheerio.load(html.data);
-    $('.list_body li').slice(0,3).each((_, el) => {
-      const title = $(el).find('a').text().trim();
-      const date = $(el).find('.date').text().trim();
-      if (!isStr(title) || !isStr(date)) return;
-      const k = key('SEOUL', title, date);
-      if (sent.has(k)) return;
-      sent.add(k);
-
-      send('⚠️ 서울 안전안내문자', `${title}\n(${date})`, true);
-    });
-  } catch {}
-}, 90_000);
+/* =========================
+   SAFETY
+========================= */
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
 
 client.login(TOKEN);
