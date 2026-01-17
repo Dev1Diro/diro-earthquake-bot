@@ -1,7 +1,6 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require('discord.js');
 const axios = require('axios');
-const xml2js = require('xml2js');
 
 /* ===============================
    ENV
@@ -10,7 +9,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_ID = process.env.OWNER_ID;
 
 if (!TOKEN || !OWNER_ID) {
-  console.error('[ENV] Missing DISCORD_TOKEN or OWNER_ID');
+  console.error('[ENV] Missing required environment variable');
   process.exit(1);
 }
 
@@ -35,7 +34,9 @@ let lastEarthquakeTime = null;
 /* ===============================
    UTIL
 ================================ */
-const isOwner = (id) => id === OWNER_ID;
+function isOwner(id) {
+  return id === OWNER_ID;
+}
 
 async function sendToAllGuilds(embed) {
   for (const guild of client.guilds.cache.values()) {
@@ -44,7 +45,8 @@ async function sendToAllGuilds(embed) {
       guild.channels.cache.find(
         c =>
           c.isTextBased() &&
-          c.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.SendMessages)
+          c.permissionsFor(guild.members.me)
+            ?.has(PermissionsBitField.Flags.SendMessages)
       );
     if (!channel) continue;
     try {
@@ -54,55 +56,47 @@ async function sendToAllGuilds(embed) {
 }
 
 /* ===============================
-   SAFEKOREA RSS (5분)
-   UA 필수
+   재난문자 JSON (SafeKorea)
+   5분 주기
 ================================ */
-async function fetchDisasterRSS() {
+async function fetchDisasterJSON() {
   if (!running) return;
 
   try {
     const res = await axios.get(
-      'https://www.safekorea.go.kr/idsiSFK/neo/rss/neo_rss.xml',
-      {
-        timeout: 10000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          'Accept': 'application/xml,text/xml'
-        }
-      }
+      'https://www.safekorea.go.kr/idsiSFK/neo/ext/json/disasterData.json',
+      { timeout: 10000 }
     );
 
-    const parsed = await xml2js.parseStringPromise(res.data);
-    const items = parsed?.rss?.channel?.[0]?.item;
-    if (!items || items.length === 0) return;
+    const list = res.data?.disasterData;
+    if (!list || list.length === 0) return;
 
-    const latest = items[0];
-    const guid = latest.guid?.[0];
-    if (!guid || guid === lastDisasterId) return;
-    lastDisasterId = guid;
+    const latest = list[0];
+    const id = latest.md101_sn;
 
-    const title = latest.title?.[0] || '재난문자';
-    const desc = latest.description?.[0] || '';
-    const pubDate = latest.pubDate?.[0] || '';
+    if (id === lastDisasterId) return;
+    lastDisasterId = id;
 
     const embed = new EmbedBuilder()
       .setTitle('📢 재난문자')
-      .setDescription(desc)
+      .setDescription(latest.msg_cn)
       .addFields(
-        { name: '제목', value: title },
-        { name: '발표 시각', value: pubDate }
+        { name: '지역', value: latest.rcptn_rgn_nm || '전국' },
+        { name: '발표시각', value: latest.creat_dt }
       )
       .setColor(0xff0000)
       .setTimestamp();
 
     await sendToAllGuilds(embed);
-  } catch (err) {
-    console.error('[RSS ERROR]', err.message);
+
+  } catch (e) {
+    console.error('[DISASTER JSON ERROR]', e.message);
   }
 }
 
 /* ===============================
-   KMA EARTHQUAKE JSON (1분)
+   지진 정보 (기상청 공개 JSON)
+   1분 주기
 ================================ */
 async function fetchEarthquake() {
   if (!running) return;
@@ -113,39 +107,40 @@ async function fetchEarthquake() {
       { timeout: 10000 }
     );
 
-    const body = res?.data?.body;
-    if (!body || body.length === 0) return;
+    const list = res.data?.body;
+    if (!list || list.length === 0) return;
 
-    const latest = body[0];
-    const time = latest.tmFc;
-    if (!time || time === lastEarthquakeTime) return;
-    lastEarthquakeTime = time;
+    const latest = list[0];
+    if (latest.tmFc === lastEarthquakeTime) return;
+    lastEarthquakeTime = latest.tmFc;
 
     const mag = parseFloat(latest.mag);
-    const loc = latest.loc || '알 수 없음';
 
     const embed = new EmbedBuilder()
       .setTitle('🌏 지진 발생')
-      .setDescription(`위치: ${loc}\n규모: **${mag}**`)
+      .setDescription(
+        `위치: ${latest.loc}\n규모: **${mag}**`
+      )
       .setColor(mag >= 4 ? 0xff0000 : 0xffff00)
       .setTimestamp();
 
     await sendToAllGuilds(embed);
-  } catch (err) {
-    console.error('[EQ ERROR]', err.message);
+
+  } catch (e) {
+    console.error('[EARTHQUAKE ERROR]', e.message);
   }
 }
 
 /* ===============================
-   COMMANDS (OWNER ONLY)
+   COMMANDS
 ================================ */
-client.on('messageCreate', async (msg) => {
+client.on('messageCreate', async msg => {
   if (!msg.guild) return;
   if (!isOwner(msg.author.id)) return;
 
   if (msg.content === '!청소') {
-    const messages = await msg.channel.messages.fetch({ limit: 100 });
-    await msg.channel.bulkDelete(messages, true);
+    const msgs = await msg.channel.messages.fetch({ limit: 100 });
+    await msg.channel.bulkDelete(msgs, true);
     await msg.channel.send('🧹 청소 완료');
   }
 
@@ -164,12 +159,12 @@ client.on('messageCreate', async (msg) => {
    READY
 ================================ */
 client.once('ready', () => {
-  console.log(`봇 로그인 완료: ${client.user.tag}`);
+  console.log(`봇 온라인: ${client.user.tag}`);
 
-  fetchDisasterRSS();
+  fetchDisasterJSON();
   fetchEarthquake();
 
-  setInterval(fetchDisasterRSS, 5 * 60 * 1000);
+  setInterval(fetchDisasterJSON, 5 * 60 * 1000);
   setInterval(fetchEarthquake, 60 * 1000);
 });
 
