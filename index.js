@@ -3,14 +3,20 @@ const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField } = require
 const axios = require('axios');
 const xml2js = require('xml2js');
 
+/* ===============================
+   ENV
+================================ */
 const TOKEN = process.env.DISCORD_TOKEN;
 const OWNER_ID = process.env.OWNER_ID;
 
 if (!TOKEN || !OWNER_ID) {
-  console.error('[ENV] Missing required environment variable');
+  console.error('[ENV] Missing DISCORD_TOKEN or OWNER_ID');
   process.exit(1);
 }
 
+/* ===============================
+   CLIENT
+================================ */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -20,23 +26,26 @@ const client = new Client({
 });
 
 /* ===============================
-   전역 상태
+   STATE
 ================================ */
 let running = true;
 let lastDisasterId = null;
 let lastEarthquakeTime = null;
 
 /* ===============================
-   유틸
+   UTIL
 ================================ */
-function isOwner(userId) {
-  return userId === OWNER_ID;
-}
+const isOwner = (id) => id === OWNER_ID;
 
 async function sendToAllGuilds(embed) {
   for (const guild of client.guilds.cache.values()) {
-    const channel = guild.systemChannel
-      || guild.channels.cache.find(c => c.isTextBased() && c.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages));
+    const channel =
+      guild.systemChannel ||
+      guild.channels.cache.find(
+        c =>
+          c.isTextBased() &&
+          c.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.SendMessages)
+      );
     if (!channel) continue;
     try {
       await channel.send({ embeds: [embed] });
@@ -45,8 +54,8 @@ async function sendToAllGuilds(embed) {
 }
 
 /* ===============================
-   재난문자 RSS (행안부 SafeKorea)
-   5분 주기
+   SAFEKOREA RSS (5분)
+   UA 필수
 ================================ */
 async function fetchDisasterRSS() {
   if (!running) return;
@@ -54,22 +63,27 @@ async function fetchDisasterRSS() {
   try {
     const res = await axios.get(
       'https://www.safekorea.go.kr/idsiSFK/neo/rss/neo_rss.xml',
-      { timeout: 10000 }
+      {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          'Accept': 'application/xml,text/xml'
+        }
+      }
     );
 
     const parsed = await xml2js.parseStringPromise(res.data);
-    const items = parsed.rss.channel[0].item;
+    const items = parsed?.rss?.channel?.[0]?.item;
     if (!items || items.length === 0) return;
 
     const latest = items[0];
-    const guid = latest.guid[0];
-
-    if (guid === lastDisasterId) return;
+    const guid = latest.guid?.[0];
+    if (!guid || guid === lastDisasterId) return;
     lastDisasterId = guid;
 
-    const title = latest.title[0];
-    const desc = latest.description[0];
-    const pubDate = latest.pubDate[0];
+    const title = latest.title?.[0] || '재난문자';
+    const desc = latest.description?.[0] || '';
+    const pubDate = latest.pubDate?.[0] || '';
 
     const embed = new EmbedBuilder()
       .setTitle('📢 재난문자')
@@ -82,15 +96,13 @@ async function fetchDisasterRSS() {
       .setTimestamp();
 
     await sendToAllGuilds(embed);
-
   } catch (err) {
     console.error('[RSS ERROR]', err.message);
   }
 }
 
 /* ===============================
-   지진 정보 (기상청 공개 JSON)
-   1분 주기
+   KMA EARTHQUAKE JSON (1분)
 ================================ */
 async function fetchEarthquake() {
   if (!running) return;
@@ -101,17 +113,16 @@ async function fetchEarthquake() {
       { timeout: 10000 }
     );
 
-    const data = res.data;
-    if (!data || !data.body || data.body.length === 0) return;
+    const body = res?.data?.body;
+    if (!body || body.length === 0) return;
 
-    const latest = data.body[0];
+    const latest = body[0];
     const time = latest.tmFc;
-
-    if (time === lastEarthquakeTime) return;
+    if (!time || time === lastEarthquakeTime) return;
     lastEarthquakeTime = time;
 
     const mag = parseFloat(latest.mag);
-    const loc = latest.loc;
+    const loc = latest.loc || '알 수 없음';
 
     const embed = new EmbedBuilder()
       .setTitle('🌏 지진 발생')
@@ -120,14 +131,13 @@ async function fetchEarthquake() {
       .setTimestamp();
 
     await sendToAllGuilds(embed);
-
   } catch (err) {
     console.error('[EQ ERROR]', err.message);
   }
 }
 
 /* ===============================
-   명령어
+   COMMANDS (OWNER ONLY)
 ================================ */
 client.on('messageCreate', async (msg) => {
   if (!msg.guild) return;
@@ -151,16 +161,14 @@ client.on('messageCreate', async (msg) => {
 });
 
 /* ===============================
-   봇 준비
+   READY
 ================================ */
 client.once('ready', () => {
   console.log(`봇 로그인 완료: ${client.user.tag}`);
 
-  // 즉시 실행
   fetchDisasterRSS();
   fetchEarthquake();
 
-  // 주기 실행
   setInterval(fetchDisasterRSS, 5 * 60 * 1000);
   setInterval(fetchEarthquake, 60 * 1000);
 });
