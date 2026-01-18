@@ -1,118 +1,219 @@
-import 'dotenv/config';
-import axios from 'axios';
-import express from 'express';
-import { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder } from 'discord.js';
-import { XMLParser } from 'fast-xml-parser';
+/*************************************************
+ * Earthquake Alert Discord Bot
+ * FINAL STABLE VERSION
+ * KMA (Korea) + JMA (Japan)
+ *************************************************/
 
-/* ===== ENV CHECK ===== */
-const { TOKEN, CHANNEL_ID, PORT } = process.env;
-if (!TOKEN || !CHANNEL_ID || !PORT) {
+import 'dotenv/config';
+import express from 'express';
+import axios from 'axios';
+import {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  REST,
+  Routes,
+  PermissionsBitField
+} from 'discord.js';
+
+/* =========================
+   ENV VALIDATION
+========================= */
+const {
+  DISCORD_TOKEN,
+  APPLICATION_ID,
+  OWNER_ID,
+  DISCORD_CHANNEL_ID,
+  PORT
+} = process.env;
+
+if (!DISCORD_TOKEN || !APPLICATION_ID || !OWNER_ID || !DISCORD_CHANNEL_ID) {
   console.error('[ENV] Missing required environment variable');
   process.exit(1);
 }
 
-/* ===== DISCORD CLIENT ===== */
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
-
-/* ===== EXPRESS (Render 포트 바인딩) ===== */
+/* =========================
+   EXPRESS (Render Port Bind)
+========================= */
 const app = express();
 app.get('/', (_, res) => res.send('OK'));
-app.listen(PORT, () => console.log(`[WEB] Listening on ${PORT}`));
+app.listen(PORT || 3000);
 
-/* ===== JMA CONFIG ===== */
-const JMA_FEED = 'https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml';
-const CHECK_INTERVAL = 5 * 60 * 1000;
-let lastEventId = null;
-
-/* ===== XML PARSER ===== */
-const parser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: ''
+/* =========================
+   DISCORD CLIENT
+========================= */
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
-/* ===== JAPANESE AUTO TRANSLATION ===== */
-function translateJP(text) {
-  if (!text) return '정보 없음';
-  return text
-    .replace(/沖/g, '해역')
-    .replace(/付近/g, '인근')
-    .replace(/北/g, '북')
-    .replace(/南/g, '남')
-    .replace(/東/g, '동')
-    .replace(/西/g, '서');
+/* =========================
+   STATE
+========================= */
+const sent = {
+  kma: new Set(),
+  jma: new Set()
+};
+let running = true;
+
+/* =========================
+   UTIL
+========================= */
+const isOwner = id => id === OWNER_ID;
+
+async function sendEmbed(embed, everyone = false) {
+  const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
+  await channel.send({
+    content: everyone ? '@everyone' : undefined,
+    embeds: [embed]
+  });
 }
 
-/* ===== FETCH JMA ===== */
+/* =========================
+   KMA (Korea)
+========================= */
+const KMA_URL =
+  'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg';
+
+async function fetchKMA() {
+  try {
+    const res = await axios.get(KMA_URL, {
+      params: {
+        serviceKey: '24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40',
+        numOfRows: 10,
+        pageNo: 1,
+        dataType: 'JSON',
+        fromTmFc: '20260115',
+        toTmFc: '20280115'
+      },
+      timeout: 8000
+    });
+
+    const items = res.data?.response?.body?.items?.item;
+    if (!Array.isArray(items)) return;
+
+    for (const e of items) {
+      if (sent.kma.has(e.tmEqk)) continue;
+      sent.kma.add(e.tmEqk);
+
+      const mag = Number(e.mt);
+      const embed = new EmbedBuilder()
+        .setTitle('🌏 지진 발생 (대한민국)')
+        .setColor(0xffffff)
+        .setDescription(
+          `📍 위치: ${e.loc}\n` +
+          `📏 규모: **${mag}**\n` +
+          `🕒 발생시각: ${e.tmEqk}`
+        )
+        .setFooter({ text: 'KMA / 기상청' });
+
+      await sendEmbed(embed, mag >= 4.0);
+    }
+  } catch (e) {
+    console.error('[KMA ERROR]', e.message);
+  }
+}
+
+/* =========================
+   JMA (Japan)
+========================= */
+const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
+
 async function fetchJMA() {
   try {
-    const xml = await axios.get(JMA_FEED, { timeout: 10000 });
-    const data = parser.parse(xml.data);
-    const entry = data.feed.entry?.[0];
-    if (!entry) return;
+    const res = await axios.get(JMA_URL, { timeout: 8000 });
+    if (!Array.isArray(res.data)) return;
 
-    if (entry.id === lastEventId) return;
-    lastEventId = entry.id;
+    const now = Date.now();
 
-    const detailXML = await axios.get(entry.link.href, { timeout: 10000 });
-    const detail = parser.parse(detailXML.data);
+    for (const e of res.data) {
+      const id = e.time + e.lat + e.lon;
+      if (sent.jma.has(id)) continue;
 
-    const eq = detail.Report.Body.Earthquake;
-    const intensity = detail.Report.Body.Intensity?.Observation?.MaxInt || '0';
+      const t = new Date(e.time).getTime();
+      if (now - t > 10 * 60 * 1000) continue;
 
-    const maxInt = parseInt(intensity.replace('+', '').replace('-', ''), 10);
-    const mention = maxInt >= 5 ? '@everyone' : '';
+      sent.jma.add(id);
 
-    const jpLoc = eq.Hypocenter.Area.Name;
-    const krLoc = translateJP(jpLoc);
+      const intensity = Number(e.maxi || 0);
+      const embed = new EmbedBuilder()
+        .setTitle('🌋 지진 발생 (일본)')
+        .setColor(0xff0000)
+        .setDescription(
+          `📍 위치: ${e.place}\n` +
+          `📏 규모: **${e.mag}**\n` +
+          `🕒 발생시각: ${e.time}`
+        )
+        .setFooter({ text: 'JMA / Japan Meteorological Agency' });
 
-    const embed = new EmbedBuilder()
-      .setTitle('🌏 지진 발생 (일본)')
-      .setColor(0xff0000)
-      .addFields(
-        { name: '진원지', value: `${krLoc} (${jpLoc})`, inline: false },
-        { name: '규모', value: `M ${eq.Magnitude}`, inline: true },
-        { name: '최대 진도', value: intensity, inline: true },
-        { name: '발생 시각', value: eq.OriginTime, inline: false }
-      )
-      .setFooter({ text: '출처: 일본 기상청(JMA)' })
-      .setTimestamp(new Date());
-
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    await channel.send({ content: mention, embeds: [embed] });
-
+      await sendEmbed(embed, intensity >= 5);
+    }
   } catch (e) {
     console.error('[JMA ERROR]', e.message);
   }
 }
 
-/* ===== SLASH COMMAND ===== */
+/* =========================
+   SCHEDULER
+========================= */
+setInterval(async () => {
+  if (!running) return;
+  await fetchKMA();
+  await fetchJMA();
+}, 60_000);
+
+/* =========================
+   SLASH COMMANDS
+========================= */
 const commands = [
-  new SlashCommandBuilder()
-    .setName('지진')
-    .setDescription('일본 최신 지진 정보 확인')
+  { name: '상태', description: '봇 상태 확인' },
+  { name: '청소', description: '캐시 초기화' },
+  { name: 'stop', description: '봇 종료' }
 ];
 
-client.once('ready', async () => {
-  console.log(`[DISCORD] Logged in as ${client.user.tag}`);
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+await rest.put(
+  Routes.applicationCommands(APPLICATION_ID),
+  { body: commands }
+);
 
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(
-    Routes.applicationCommands(client.user.id),
-    { body: commands }
-  );
+/* =========================
+   COMMAND HANDLER
+========================= */
+client.on('interactionCreate', async i => {
+  if (!i.isChatInputCommand()) return;
+  if (!isOwner(i.user.id)) return i.reply({ content: '권한 없음', ephemeral: true });
 
-  setInterval(fetchJMA, CHECK_INTERVAL);
-});
+  if (i.commandName === '상태') {
+    await i.reply('🟢 정상 작동 중');
+  }
 
-/* ===== INTERACTION ===== */
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === '지진') {
-    await interaction.reply('최근 일본 지진 감시 중입니다.');
+  if (i.commandName === '청소') {
+    sent.kma.clear();
+    sent.jma.clear();
+    await i.reply('🧹 캐시 초기화 완료');
+  }
+
+  if (i.commandName === 'stop') {
+    await i.reply('⛔ 봇 종료');
+    process.exit(0);
   }
 });
 
-/* ===== LOGIN ===== */
-client.login(TOKEN);
+/* =========================
+   READY
+========================= */
+client.once('ready', () => {
+  console.log(`로그인 완료: ${client.user.tag}`);
+});
+
+/* =========================
+   SAFETY
+========================= */
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', () => {});
+
+client.login(DISCORD_TOKEN);
