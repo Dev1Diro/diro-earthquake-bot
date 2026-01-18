@@ -1,238 +1,133 @@
-/*************************************************
- * Earthquake Alert Discord Bot
- * FINAL STABLE + SLASH COMMANDS
- * KMA (Korea) + JMA (Japan)
- *************************************************/
-
-require('dotenv').config();
-const {
+import 'dotenv/config';
+import express from 'express';
+import axios from 'axios';
+import {
   Client,
   GatewayIntentBits,
-  EmbedBuilder,
   REST,
-  Routes
-} = require('discord.js');
-const axios = require('axios');
+  Routes,
+  SlashCommandBuilder,
+  EmbedBuilder
+} from 'discord.js';
 
-/* ===============================
-   ENV
-================================ */
-const TOKEN = process.env.DISCORD_TOKEN;
-const OWNER_ID = process.env.OWNER_ID;
-const KMA_KEY = process.env.KMA_API_KEY;
+/* ================= ENV ================= */
+const TOKEN = process.env.TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+const PORT = process.env.PORT || 10000;
 
-if (!TOKEN || !OWNER_ID || !KMA_KEY) {
-  console.error('[ENV] Missing required environment variable');
+if (!TOKEN || !CHANNEL_ID) {
+  console.error('[ENV] TOKEN or CHANNEL_ID missing');
   process.exit(1);
 }
 
-/* ===============================
-   CLIENT
-================================ */
+/* ================= WEB SERVER (Render) ================= */
+const app = express();
+app.get('/', (_, res) => res.send('OK'));
+app.listen(PORT, () => console.log(`[WEB] ${PORT}`));
+
+/* ================= DISCORD ================= */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-/* ===============================
-   STATE
-================================ */
-let running = true;
-const sent = {
-  kma: new Set(),
-  jma: new Set()
-};
+/* ================= API ================= */
+const KMA_URL = 'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40&numOfRows=10&pageNo=1&fromTmFc=20260115&toTmFc=20290115';
+const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
 
-/* ===============================
-   TIME UTIL (KST)
-================================ */
-function ymd(daysAgo = 0) {
-  const d = new Date(Date.now() + 9 * 3600000 - daysAgo * 86400000);
-  return d.toISOString().slice(0, 10).replace(/-/g, '');
+const SENT = new Set();
+
+/* ================= UTIL ================= */
+function jmaIntensityToNum(v) {
+  if (!v) return 0;
+  if (v.includes('7')) return 7;
+  if (v.includes('6強')) return 6.5;
+  if (v.includes('6弱')) return 6;
+  if (v.includes('5強')) return 5.5;
+  if (v.includes('5弱')) return 5;
+  return Number(v) || 0;
 }
 
-/* ===============================
-   SAFE GET
-================================ */
-async function safeGet(url, params = {}) {
+/* ================= KMA ================= */
+async function checkKMA() {
   try {
-    const res = await axios.get(url, {
-      params,
-      timeout: 8000
-    });
-    return res.data;
-  } catch {
-    return null;
-  }
-}
+    const { data } = await axios.get(KMA_URL, { timeout: 10000 });
+    const eq = data?.body?.[0];
+    if (!eq || SENT.has(eq.tmFc)) return;
 
-/* ===============================
-   KMA FETCH
-================================ */
-async function fetchKMA() {
-  const data = await safeGet(
-    'https://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg',
-    {
-      serviceKey: KMA_KEY,
-      numOfRows: 5,
-      pageNo: 1,
-      dataType: 'JSON',
-      fromTmFc: ymd(3),
-      toTmFc: ymd(0)
-    }
-  );
-
-  return data?.response?.body?.items?.item ?? [];
-}
-
-/* ===============================
-   JMA FETCH
-================================ */
-async function fetchJMA() {
-  const data = await safeGet(
-    'https://www.jma.go.jp/bosai/quake/data/list.json'
-  );
-  if (!Array.isArray(data)) return [];
-
-  const now = Date.now();
-  return data.filter(e => {
-    const t = new Date(e.time).getTime();
-    return t && now - t < 10 * 60 * 1000;
-  });
-}
-
-/* ===============================
-   BROADCAST
-================================ */
-async function broadcast(embed, everyone = false) {
-  for (const guild of client.guilds.cache.values()) {
-    const channel =
-      guild.systemChannel ||
-      guild.channels.cache.find(c => c.isTextBased());
-
-    if (!channel) continue;
-
-    try {
-      await channel.send({
-        content: everyone ? '@everyone' : undefined,
-        embeds: [embed]
-      });
-    } catch {}
-  }
-}
-
-/* ===============================
-   HANDLE KMA
-================================ */
-async function handleKMA() {
-  for (const e of await fetchKMA()) {
-    if (!e.eqkNo || sent.kma.has(e.eqkNo)) continue;
-    sent.kma.add(e.eqkNo);
-
-    const mag = Number(e.mag || 0);
-    const everyone = mag >= 4.0;
+    SENT.add(eq.tmFc);
+    const mag = Number(eq.mag);
+    const mention = mag >= 4 ? '@everyone' : '';
 
     const embed = new EmbedBuilder()
-      .setTitle('🇰🇷 국내 지진 발생')
-      .setDescription(
-        `📍 위치: ${e.loc}\n🕒 시각: ${e.tmEqk}\n📏 규모: **${mag}**`
-      )
-      .setFooter({ text: '기상청(KMA)' })
-      .setTimestamp();
+      .setTitle('🇰🇷 한국 지진')
+      .setDescription(`위치: ${eq.loc}\n규모: **${mag}**`)
+      .setColor(mag >= 4 ? 0xff0000 : 0xffff00)
+      .setFooter({ text: 'KMA' });
 
-    await broadcast(embed, everyone);
+    const ch = await client.channels.fetch(CHANNEL_ID);
+    await ch.send({ content: mention, embeds: [embed] });
+
+  } catch (e) {
+    console.error('[KMA ERROR]', e.message);
   }
 }
 
-/* ===============================
-   HANDLE JMA
-================================ */
-async function handleJMA() {
-  for (const e of await fetchJMA()) {
-    const id = `${e.time}_${e.lat}_${e.lon}`;
-    if (sent.jma.has(id)) continue;
-    sent.jma.add(id);
+/* ================= JMA ================= */
+async function checkJMA() {
+  try {
+    const { data } = await axios.get(JMA_URL, { timeout: 10000 });
+    const q = data?.[0];
+    if (!q || SENT.has(q.eid)) return;
 
-    const scale = Number(e.maxScale || 0);
-    const everyone = scale >= 55; // 진도 5+
+    SENT.add(q.eid);
+    const intensity = jmaIntensityToNum(q.maxi);
+    const mention = intensity >= 5 ? '@everyone' : '';
 
     const embed = new EmbedBuilder()
-      .setTitle('🇯🇵 일본 지진 감지')
-      .setDescription(
-        `📍 위치: ${e.place || '일본 인근'}\n🕒 시각: ${e.time}\n📏 규모: ${e.mag}\n📊 최대진도: ${scale}`
-      )
-      .setFooter({ text: '일본기상청(JMA)' })
-      .setTimestamp();
+      .setTitle('🇯🇵 일본 지진')
+      .setDescription(`지역: ${q.anm}\n최대 진도: **${q.maxi}**`)
+      .setColor(intensity >= 5 ? 0xff0000 : 0xffaa00)
+      .setFooter({ text: 'JMA' });
 
-    await broadcast(embed, everyone);
+    const ch = await client.channels.fetch(CHANNEL_ID);
+    await ch.send({ content: mention, embeds: [embed] });
+
+  } catch (e) {
+    console.error('[JMA ERROR]', e.message);
   }
 }
 
-/* ===============================
-   SCHEDULER (1 MIN)
-================================ */
-setInterval(async () => {
-  if (!running) return;
-  await handleKMA();
-  await handleJMA();
-}, 60_000);
-
-/* ===============================
-   SLASH COMMANDS
-================================ */
+/* ================= SLASH COMMAND ================= */
 const commands = [
-  { name: 'status', description: '지진 감시 상태 확인' },
-  { name: 'stop', description: '지진 감시 중지 (관리자)' },
-  { name: 'start', description: '지진 감시 재개 (관리자)' },
-  { name: 'clear', description: '지진 캐시 초기화 (관리자)' }
-];
+  new SlashCommandBuilder().setName('ping').setDescription('봇 상태'),
+  new SlashCommandBuilder().setName('force').setDescription('지진 수동 체크')
+].map(c => c.toJSON());
 
-const rest = new REST({ version: '10' }).setToken(TOKEN);
+client.once('ready', async () => {
+  console.log(`[READY] ${client.user.tag}`);
 
-(async () => {
-  try {
-    await rest.put(
-      Routes.applicationCommands(client.application?.id || '@me'),
-      { body: commands }
-    );
-  } catch {}
-})();
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  await rest.put(
+    Routes.applicationCommands(client.user.id),
+    { body: commands }
+  );
+
+  setInterval(checkKMA, 60_000);
+  setInterval(checkJMA, 60_000);
+});
 
 client.on('interactionCreate', async i => {
   if (!i.isChatInputCommand()) return;
 
-  if (i.commandName === 'status') {
-    await i.reply(
-      `상태: ${running ? '🟢 작동중' : '🔴 중지됨'}\nKMA 캐시: ${sent.kma.size}\nJMA 캐시: ${sent.jma.size}`
-    );
+  if (i.commandName === 'ping') {
+    await i.reply('🟢 정상 작동 중');
   }
 
-  if (i.user.id !== OWNER_ID) {
-    await i.reply({ content: '권한 없음', ephemeral: true });
-    return;
+  if (i.commandName === 'force') {
+    await i.reply('⏳ 수동 체크');
+    await checkKMA();
+    await checkJMA();
   }
-
-  if (i.commandName === 'stop') {
-    running = false;
-    await i.reply('⛔ 지진 감시 중지');
-  }
-
-  if (i.commandName === 'start') {
-    running = true;
-    await i.reply('✅ 지진 감시 재개');
-  }
-
-  if (i.commandName === 'clear') {
-    sent.kma.clear();
-    sent.jma.clear();
-    await i.reply('🧹 캐시 초기화 완료');
-  }
-});
-
-/* ===============================
-   READY
-================================ */
-client.once('ready', () => {
-  console.log(`지진봇 온라인: ${client.user.tag}`);
 });
 
 client.login(TOKEN);
