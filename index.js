@@ -1,110 +1,101 @@
 import 'dotenv/config';
-import express from 'express';
 import axios from 'axios';
-import {
-  Client,
-  GatewayIntentBits,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  EmbedBuilder
-} from 'discord.js';
+import express from 'express';
+import { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { XMLParser } from 'fast-xml-parser';
 
-/* ================= ENV ================= */
-const TOKEN = process.env.TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
-const PORT = process.env.PORT || 10000;
-
-if (!TOKEN || !CHANNEL_ID) {
-  console.error('[ENV] TOKEN or CHANNEL_ID missing');
+/* ===== ENV CHECK ===== */
+const { TOKEN, CHANNEL_ID, PORT } = process.env;
+if (!TOKEN || !CHANNEL_ID || !PORT) {
+  console.error('[ENV] Missing required environment variable');
   process.exit(1);
 }
 
-/* ================= WEB SERVER (Render) ================= */
-const app = express();
-app.get('/', (_, res) => res.send('OK'));
-app.listen(PORT, () => console.log(`[WEB] ${PORT}`));
-
-/* ================= DISCORD ================= */
+/* ===== DISCORD CLIENT ===== */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-/* ================= API ================= */
-const KMA_URL = 'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=24bc4012ff20c13ec2e86cf01deeee5fdc93676f4ea9f24bbc87097e0b1a2d40&numOfRows=10&pageNo=1&fromTmFc=20260115&toTmFc=20290115';
-const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
+/* ===== EXPRESS (Render 포트 바인딩) ===== */
+const app = express();
+app.get('/', (_, res) => res.send('OK'));
+app.listen(PORT, () => console.log(`[WEB] Listening on ${PORT}`));
 
-const SENT = new Set();
+/* ===== JMA CONFIG ===== */
+const JMA_FEED = 'https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml';
+const CHECK_INTERVAL = 5 * 60 * 1000;
+let lastEventId = null;
 
-/* ================= UTIL ================= */
-function jmaIntensityToNum(v) {
-  if (!v) return 0;
-  if (v.includes('7')) return 7;
-  if (v.includes('6強')) return 6.5;
-  if (v.includes('6弱')) return 6;
-  if (v.includes('5強')) return 5.5;
-  if (v.includes('5弱')) return 5;
-  return Number(v) || 0;
+/* ===== XML PARSER ===== */
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: ''
+});
+
+/* ===== JAPANESE AUTO TRANSLATION ===== */
+function translateJP(text) {
+  if (!text) return '정보 없음';
+  return text
+    .replace(/沖/g, '해역')
+    .replace(/付近/g, '인근')
+    .replace(/北/g, '북')
+    .replace(/南/g, '남')
+    .replace(/東/g, '동')
+    .replace(/西/g, '서');
 }
 
-/* ================= KMA ================= */
-async function checkKMA() {
+/* ===== FETCH JMA ===== */
+async function fetchJMA() {
   try {
-    const { data } = await axios.get(KMA_URL, { timeout: 10000 });
-    const eq = data?.body?.[0];
-    if (!eq || SENT.has(eq.tmFc)) return;
+    const xml = await axios.get(JMA_FEED, { timeout: 10000 });
+    const data = parser.parse(xml.data);
+    const entry = data.feed.entry?.[0];
+    if (!entry) return;
 
-    SENT.add(eq.tmFc);
-    const mag = Number(eq.mag);
-    const mention = mag >= 4 ? '@everyone' : '';
+    if (entry.id === lastEventId) return;
+    lastEventId = entry.id;
+
+    const detailXML = await axios.get(entry.link.href, { timeout: 10000 });
+    const detail = parser.parse(detailXML.data);
+
+    const eq = detail.Report.Body.Earthquake;
+    const intensity = detail.Report.Body.Intensity?.Observation?.MaxInt || '0';
+
+    const maxInt = parseInt(intensity.replace('+', '').replace('-', ''), 10);
+    const mention = maxInt >= 5 ? '@everyone' : '';
+
+    const jpLoc = eq.Hypocenter.Area.Name;
+    const krLoc = translateJP(jpLoc);
 
     const embed = new EmbedBuilder()
-      .setTitle('🇰🇷 한국 지진')
-      .setDescription(`위치: ${eq.loc}\n규모: **${mag}**`)
-      .setColor(mag >= 4 ? 0xff0000 : 0xffff00)
-      .setFooter({ text: 'KMA' });
+      .setTitle('🌏 지진 발생 (일본)')
+      .setColor(0xff0000)
+      .addFields(
+        { name: '진원지', value: `${krLoc} (${jpLoc})`, inline: false },
+        { name: '규모', value: `M ${eq.Magnitude}`, inline: true },
+        { name: '최대 진도', value: intensity, inline: true },
+        { name: '발생 시각', value: eq.OriginTime, inline: false }
+      )
+      .setFooter({ text: '출처: 일본 기상청(JMA)' })
+      .setTimestamp(new Date());
 
-    const ch = await client.channels.fetch(CHANNEL_ID);
-    await ch.send({ content: mention, embeds: [embed] });
-
-  } catch (e) {
-    console.error('[KMA ERROR]', e.message);
-  }
-}
-
-/* ================= JMA ================= */
-async function checkJMA() {
-  try {
-    const { data } = await axios.get(JMA_URL, { timeout: 10000 });
-    const q = data?.[0];
-    if (!q || SENT.has(q.eid)) return;
-
-    SENT.add(q.eid);
-    const intensity = jmaIntensityToNum(q.maxi);
-    const mention = intensity >= 5 ? '@everyone' : '';
-
-    const embed = new EmbedBuilder()
-      .setTitle('🇯🇵 일본 지진')
-      .setDescription(`지역: ${q.anm}\n최대 진도: **${q.maxi}**`)
-      .setColor(intensity >= 5 ? 0xff0000 : 0xffaa00)
-      .setFooter({ text: 'JMA' });
-
-    const ch = await client.channels.fetch(CHANNEL_ID);
-    await ch.send({ content: mention, embeds: [embed] });
+    const channel = await client.channels.fetch(CHANNEL_ID);
+    await channel.send({ content: mention, embeds: [embed] });
 
   } catch (e) {
     console.error('[JMA ERROR]', e.message);
   }
 }
 
-/* ================= SLASH COMMAND ================= */
+/* ===== SLASH COMMAND ===== */
 const commands = [
-  new SlashCommandBuilder().setName('ping').setDescription('봇 상태'),
-  new SlashCommandBuilder().setName('force').setDescription('지진 수동 체크')
-].map(c => c.toJSON());
+  new SlashCommandBuilder()
+    .setName('지진')
+    .setDescription('일본 최신 지진 정보 확인')
+];
 
 client.once('ready', async () => {
-  console.log(`[READY] ${client.user.tag}`);
+  console.log(`[DISCORD] Logged in as ${client.user.tag}`);
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   await rest.put(
@@ -112,22 +103,16 @@ client.once('ready', async () => {
     { body: commands }
   );
 
-  setInterval(checkKMA, 60_000);
-  setInterval(checkJMA, 60_000);
+  setInterval(fetchJMA, CHECK_INTERVAL);
 });
 
-client.on('interactionCreate', async i => {
-  if (!i.isChatInputCommand()) return;
-
-  if (i.commandName === 'ping') {
-    await i.reply('🟢 정상 작동 중');
-  }
-
-  if (i.commandName === 'force') {
-    await i.reply('⏳ 수동 체크');
-    await checkKMA();
-    await checkJMA();
+/* ===== INTERACTION ===== */
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName === '지진') {
+    await interaction.reply('최근 일본 지진 감시 중입니다.');
   }
 });
 
+/* ===== LOGIN ===== */
 client.login(TOKEN);
