@@ -24,7 +24,7 @@
     "check": "node --check index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
   },
   "dependencies": {
     "axios": "^1.6.7",
