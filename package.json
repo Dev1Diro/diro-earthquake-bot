@@ -1,15 +1,26 @@
 {
-  "name": "earthquake-bot",
-  "version": "1.0.0",
-  "main": "index.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.14.1",
-    "axios": "^1.6.7",
-    "xml2js": "^0.6.2",
-    "express": "^4.19.2"
-  }
-}
+   "name": "earthquake-bot",
+   "version": "1.0.0",
+-  "main": "index.js",
+-  "type": "commonjs",
+-  "scripts": {
+-    "start": "node index.js"
+-  },
++  "description": "Discord bot for Korea/Japan earthquake alerts.",
++  "main": "index.js",
++  "type": "module",
++  "scripts": {
++    "start": "node index.js",
++    "check": "node --check index.js"
++  },
++  "engines": {
++    "node": ">=18"
++  },
+   "dependencies": {
+     "discord.js": "^14.14.1",
+     "axios": "^1.6.7",
+     "xml2js": "^0.6.2",
+     "express": "^4.19.2"
+   }
+-}
++}
