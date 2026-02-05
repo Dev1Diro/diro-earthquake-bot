@@ -1,7 +1,6 @@
 /*************************************************
  * Earthquake Alert Discord Bot
- * STABLE VERSION
- * KMA (Korea) + JMA (Japan)
+ * STABLE VERSION (with health & graceful shutdown)
  *************************************************/
 
 import 'dotenv/config';
@@ -36,9 +35,24 @@ if (!DISCORD_TOKEN || !APPLICATION_ID || !OWNER_ID) {
    EXPRESS (health)
 ========================= */
 const app = express();
-app.get('/', (_, res) => res.send('OK'));
-app.listen(PORT || 3000, () => {
-  console.log(`[HTTP] Listening on port ${PORT || 3000}`);
+
+// 기본 루트: 간단한 확인용
+app.get('/', (_, res) => res.status(200).send('Bot is running'));
+
+// 헬스체크 엔드포인트: UptimeRobot에 등록할 URL
+app.get('/health', (_, res) => {
+  const payload = {
+    status: 'ok',
+    uptime_seconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  };
+  console.log('[HTTP] /health checked');
+  return res.status(200).json(payload);
+});
+
+const LISTEN_PORT = Number(PORT) || 3000;
+const server = app.listen(LISTEN_PORT, () => {
+  console.log(`[HTTP] Listening on port ${LISTEN_PORT}`);
 });
 
 /* =========================
@@ -157,7 +171,6 @@ async function fetchKMA() {
         )
         .setFooter({ text: 'KMA / 기상청' });
 
-      // try to set timestamp if parsable
       const t = Date.parse(e.tmEqk);
       if (!Number.isNaN(t)) embed.setTimestamp(new Date(t));
 
@@ -214,20 +227,33 @@ async function fetchJMA() {
 }
 
 /* =========================
-   SCHEDULER
+   SCHEDULER (start after ready)
 ========================= */
 let pollInFlight = false;
 const POLL_INTERVAL_MS = 60_000;
+let pollIntervalHandle = null;
 
-setInterval(async () => {
-  if (!running || pollInFlight) return;
-  pollInFlight = true;
-  try {
-    await Promise.allSettled([fetchKMA(), fetchJMA()]);
-  } finally {
-    pollInFlight = false;
+function startPolling() {
+  if (pollIntervalHandle) return;
+  pollIntervalHandle = setInterval(async () => {
+    if (!running || pollInFlight) return;
+    pollInFlight = true;
+    try {
+      await Promise.allSettled([fetchKMA(), fetchJMA()]);
+    } finally {
+      pollInFlight = false;
+    }
+  }, POLL_INTERVAL_MS);
+  console.log('[SCHEDULER] Polling started');
+}
+
+function stopPolling() {
+  if (pollIntervalHandle) {
+    clearInterval(pollIntervalHandle);
+    pollIntervalHandle = null;
+    console.log('[SCHEDULER] Polling stopped');
   }
-}, POLL_INTERVAL_MS);
+}
 
 /* =========================
    SLASH COMMANDS
@@ -288,12 +314,16 @@ client.on('interactionCreate', async interaction => {
 client.once('ready', async () => {
   console.log(`로그인 완료: ${client.user.tag}`);
   await registerCommands();
-  // initial fetch on startup
+
+  // initial fetch on startup (non-blocking)
   try {
     await Promise.allSettled([fetchKMA(), fetchJMA()]);
   } catch (e) {
     console.error('[STARTUP FETCH ERROR]', e?.message || e);
   }
+
+  // start scheduler only after client is ready
+  startPolling();
 });
 
 /* =========================
@@ -313,3 +343,39 @@ client.login(DISCORD_TOKEN).catch(err => {
   console.error('[DISCORD LOGIN FAILED]', err?.message || err);
   process.exit(1);
 });
+
+/* =========================
+   GRACEFUL SHUTDOWN
+========================= */
+async function shutdown(signal) {
+  console.log(`[SHUTDOWN] Received ${signal}, shutting down...`);
+  running = false;
+  stopPolling();
+
+  try {
+    if (client && client.destroy) {
+      await client.destroy();
+      console.log('[SHUTDOWN] Discord client destroyed');
+    }
+  } catch (e) {
+    console.error('[SHUTDOWN] Error destroying Discord client', e?.message || e);
+  }
+
+  try {
+    server.close(() => {
+      console.log('[SHUTDOWN] HTTP server closed');
+      process.exit(0);
+    });
+    // force exit if not closed in time
+    setTimeout(() => {
+      console.warn('[SHUTDOWN] Forcing exit');
+      process.exit(0);
+    }, 5000);
+  } catch (e) {
+    console.error('[SHUTDOWN] Error closing server', e?.message || e);
+    process.exit(1);
+  }
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
