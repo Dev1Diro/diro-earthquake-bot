@@ -1,10 +1,9 @@
 /*************************************************
  * Earthquake Alert Discord Bot (완전판)
  * - 이벤트 수신 즉시 기록(mark) 후 전송 시도
- * - 기본 ROLLBACK_ON_FAILURE = true (환경변수로 변경 가능)
+ * - 기본 ROLLBACK_ON_FAILURE = true
  * - 채널별 재시도(지수 백오프), 개별 채널 실패는 전체 실패로 간주하지 않음
- * - 파일 기반 상태(sent-kma.json / sent-jma.json) 원자적 저장
- * - KMA 키: 환경변수 KMA_KEY 사용
+ * - 발생시각 포맷 안정화: KMA YYYYMMDDHHmmss 파싱 지원 + fallback
  *************************************************/
 
 import 'dotenv/config';
@@ -34,7 +33,6 @@ const {
   NUM_ROWS,
   SENT_DIR,
   KMA_KEY,
-  // 추가 설정
   SEND_MAX_RETRIES,
   SEND_RETRY_BASE_MS,
   ROLLBACK_ON_FAILURE
@@ -49,7 +47,6 @@ const CONFIG = {
   PERSIST_INTERVAL_MS: 60_000,
   SEND_MAX_RETRIES: Number(SEND_MAX_RETRIES) || 3,
   SEND_RETRY_BASE_MS: Number(SEND_RETRY_BASE_MS) || 500,
-  // 기본값 true로 설정 (요청 반영)
   ROLLBACK_ON_FAILURE: (ROLLBACK_ON_FAILURE === undefined) ? true : (ROLLBACK_ON_FAILURE === 'true')
 };
 
@@ -208,9 +205,36 @@ async function getChannel(channelId) {
 }
 
 /* =========================
-   MARK & SEND 로직 (요청 반영)
-   - 이벤트 수신 즉시 markSentImmediate 호출
-   - 이후 sendEmbedAfterMark 로 전송 시도
+   TIME PARSERS
+   - KMA: YYYYMMDDHHmmss (e.g., 20260209103329)
+   - fallback: Date.parse
+========================= */
+function parseKmaTime(str) {
+  if (!str) return NaN;
+  const s = String(str).trim();
+  if (/^\d{14}$/.test(s)) {
+    const yyyy = Number(s.slice(0, 4));
+    const MM = Number(s.slice(4, 6)) - 1;
+    const dd = Number(s.slice(6, 8));
+    const hh = Number(s.slice(8, 10));
+    const mm = Number(s.slice(10, 12));
+    const ss = Number(s.slice(12, 14));
+    const dt = new Date(yyyy, MM, dd, hh, mm, ss);
+    return Number.isFinite(dt.getTime()) ? dt.getTime() : NaN;
+  }
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : NaN;
+}
+
+function parseGenericTime(str) {
+  if (!str) return NaN;
+  const s = String(str).trim();
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : NaN;
+}
+
+/* =========================
+   MARK & SEND 로직
 ========================= */
 
 // 즉시 마킹 및 원자적 저장 (이벤트 수신 즉시 호출)
@@ -394,7 +418,7 @@ async function fetchKMA() {
         const uniqueId = `${String(e.tmEqk)}|${String(e.loc)}|${String(e.mt ?? '')}`;
         if (sent.kma.has(uniqueId)) continue;
 
-        const t = Date.parse(String(e.tmEqk));
+        const t = parseKmaTime(String(e.tmEqk));
         if (!Number.isFinite(t)) {
           console.warn('[KMA] 발생시각 파싱 실패, 스킵:', e.tmEqk);
           continue;
@@ -409,7 +433,7 @@ async function fetchKMA() {
           .addFields(
             { name: '📍 위치', value: String(e.loc), inline: false },
             { name: '📏 규모', value: Number.isFinite(mag) ? `**${mag.toFixed(1)}**` : '정보 없음', inline: true },
-            { name: '🕒 발생시각', value: String(e.tmEqk), inline: true }
+            { name: '🕒 발생시각', value: new Date(t).toISOString(), inline: true }
           )
           .setFooter({ text: 'KMA / 기상청' });
 
@@ -421,7 +445,6 @@ async function fetchKMA() {
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
 
         const mentionEveryone = Number.isFinite(mag) && mag >= 4.0;
-        // 변경: 이벤트 수신 즉시 기록 후 전송 시도
         await sendEmbedAfterMark('kma', uniqueId, embed, mentionEveryone);
       } catch (innerErr) {
         console.error('[KMA ITEM ERROR]', innerErr?.message || innerErr);
@@ -464,7 +487,7 @@ async function fetchJMA() {
         const id = `${e.time}-${e.lat ?? ''}-${e.lon ?? ''}-${e.place}`;
         if (sent.jma.has(id)) continue;
 
-        const t = Date.parse(e.time);
+        const t = parseGenericTime(e.time);
         if (!Number.isFinite(t)) {
           console.warn('[JMA] 발생시각 파싱 실패, 스킵:', e.time);
           continue;
@@ -481,7 +504,7 @@ async function fetchJMA() {
             { name: '📍 위치', value: String(e.place), inline: false },
             { name: '📏 규모', value: Number.isFinite(mag) ? `**${mag.toFixed(1)}**` : '정보 없음', inline: true },
             { name: '💥 최대진도', value: e.maxi ? String(e.maxi) : '정보 없음', inline: true },
-            { name: '🕒 발생시각', value: String(e.time), inline: true }
+            { name: '🕒 발생시각', value: new Date(t).toISOString(), inline: true }
           )
           .setFooter({ text: 'JMA / Japan Meteorological Agency' });
 
