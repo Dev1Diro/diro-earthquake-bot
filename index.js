@@ -1,10 +1,10 @@
 /*************************************************
- * Earthquake Alert Discord Bot
- * - File-only persistence (sent-kma.json / sent-jma.json)
- * - 임베드 전송 성공 후에만 전송 이력 저장
- * - 시작 시 sent 파일이 없으면 빈 배열로 자동 생성
- * - KMA 키는 환경변수 KMA_KEY 사용
- * - KMA: 오늘(00:00~23:59 KST) 조회, 최근 N분(기본 30분) 필터
+ * Earthquake Alert Discord Bot (완전판)
+ * - 이벤트 수신 즉시 기록(mark) 후 전송 시도
+ * - 기본 ROLLBACK_ON_FAILURE = true (환경변수로 변경 가능)
+ * - 채널별 재시도(지수 백오프), 개별 채널 실패는 전체 실패로 간주하지 않음
+ * - 파일 기반 상태(sent-kma.json / sent-jma.json) 원자적 저장
+ * - KMA 키: 환경변수 KMA_KEY 사용
  *************************************************/
 
 import 'dotenv/config';
@@ -33,7 +33,11 @@ const {
   KMA_RECENT_MINUTES,
   NUM_ROWS,
   SENT_DIR,
-  KMA_KEY
+  KMA_KEY,
+  // 추가 설정
+  SEND_MAX_RETRIES,
+  SEND_RETRY_BASE_MS,
+  ROLLBACK_ON_FAILURE
 } = process.env;
 
 const CONFIG = {
@@ -42,7 +46,11 @@ const CONFIG = {
   KMA_RECENT_MINUTES: Number(KMA_RECENT_MINUTES) || 30,
   NUM_ROWS: Number(NUM_ROWS) || 50,
   SENT_DIR: SENT_DIR || path.resolve(process.cwd(), 'sent-state'),
-  PERSIST_INTERVAL_MS: 60_000
+  PERSIST_INTERVAL_MS: 60_000,
+  SEND_MAX_RETRIES: Number(SEND_MAX_RETRIES) || 3,
+  SEND_RETRY_BASE_MS: Number(SEND_RETRY_BASE_MS) || 500,
+  // 기본값 true로 설정 (요청 반영)
+  ROLLBACK_ON_FAILURE: (ROLLBACK_ON_FAILURE === undefined) ? true : (ROLLBACK_ON_FAILURE === 'true')
 };
 
 if (!DISCORD_TOKEN || !APPLICATION_ID || !OWNER_ID) {
@@ -86,8 +94,6 @@ const client = new Client({
 
 /* =========================
    STATE (file-based)
-   - sent-kma.json, sent-jma.json
-   - 시작 시 파일이 없으면 빈 배열로 생성
 ========================= */
 const sent = { kma: new Set(), jma: new Set() };
 const SENT_KMA_PATH = path.join(CONFIG.SENT_DIR, 'sent-kma.json');
@@ -201,42 +207,106 @@ async function getChannel(channelId) {
   }
 }
 
-async function sendEmbed(embed, everyone = false) {
-  await Promise.all(
+/* =========================
+   MARK & SEND 로직 (요청 반영)
+   - 이벤트 수신 즉시 markSentImmediate 호출
+   - 이후 sendEmbedAfterMark 로 전송 시도
+========================= */
+
+// 즉시 마킹 및 원자적 저장 (이벤트 수신 즉시 호출)
+async function markSentImmediate(kind, uniqueId) {
+  try {
+    sent[kind].add(uniqueId);
+    await persistSentStateToFiles();
+    console.info(`[STATE] Marked ${kind} as sent (immediate): ${uniqueId}`);
+  } catch (e) {
+    console.error('[STATE] markSentImmediate failed', e?.message || e);
+  }
+}
+
+// 채널별 전송 시도 (재시도 포함)
+async function sendToChannelWithRetries(channel, payload, maxRetries = CONFIG.SEND_MAX_RETRIES) {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    try {
+      if (!channel) throw new Error('채널 없음');
+      if (typeof channel.isTextBased === 'function' && !channel.isTextBased()) {
+        throw new Error('텍스트 전송 불가 채널');
+      }
+      await channel.send(payload);
+      return { ok: true };
+    } catch (err) {
+      attempt += 1;
+      const msg = err?.message || String(err);
+      const isRateLimit = /429|rate limit/i.test(msg);
+      const backoff = CONFIG.SEND_RETRY_BASE_MS * Math.pow(2, attempt - 1) * (isRateLimit ? 2 : 1);
+      console.warn(`[DISCORD SEND] 채널 전송 실패 (attempt ${attempt}/${maxRetries})`, msg);
+      if (attempt > maxRetries) {
+        return { ok: false, error: msg };
+      }
+      await new Promise(res => setTimeout(res, backoff));
+    }
+  }
+  return { ok: false, error: 'unknown' };
+}
+
+// 마킹 후 전송: 이벤트 받자마자 기록하고 전송 시도
+async function sendEmbedAfterMark(kind, uniqueId, embed, everyone = false) {
+  // 1) 즉시 마킹 및 디스크 저장
+  await markSentImmediate(kind, uniqueId);
+
+  // 2) 전송 페이로드 준비
+  const payload = {
+    content: everyone ? '@everyone' : undefined,
+    embeds: [embed],
+    allowedMentions: { parse: everyone ? ['everyone'] : [] }
+  };
+
+  // 3) 채널별 전송 병렬 처리
+  const results = await Promise.all(
     CHANNEL_IDS_LIST.map(async channelId => {
       const channel = await getChannel(channelId);
       if (!channel) {
         console.warn('[DISCORD] 채널 없음', channelId);
-        return;
+        return { channelId, ok: false, error: 'no-channel' };
       }
-      if (typeof channel.isTextBased === 'function' && !channel.isTextBased()) {
-        console.warn('[DISCORD] 텍스트 전송 불가 채널, 스킵', channelId);
-        return;
+      try {
+        const res = await sendToChannelWithRetries(channel, payload);
+        if (res.ok) {
+          console.info('[DISCORD] 메시지 전송 완료', channelId);
+          return { channelId, ok: true };
+        } else {
+          console.warn('[DISCORD] 메시지 전송 실패', channelId, res.error);
+          return { channelId, ok: false, error: res.error };
+        }
+      } catch (err) {
+        console.error('[DISCORD] 채널 전송 예외', channelId, err?.message || err);
+        return { channelId, ok: false, error: err?.message || err };
       }
-      await channel.send({
-        content: everyone ? '@everyone' : undefined,
-        embeds: [embed],
-        allowedMentions: { parse: everyone ? ['everyone'] : [] }
-      });
-      console.info('[DISCORD] 메시지 전송 완료', channelId);
     })
   );
-}
 
-// 전송 성공 후에만 마킹하고 파일에 저장
-async function sendEmbedAndPersist(kind, uniqueId, embed, everyone = false) {
-  try {
-    await sendEmbed(embed, everyone);
-    // 전송 성공 시 메모리 마킹
-    sent[kind].add(uniqueId);
-    // 즉시 원자적 저장 (await 하여 보장)
-    await persistSentStateToFiles();
-    console.info(`[SEND] ${kind} sent and persisted: ${uniqueId}`);
+  // 4) 결과 평가: 하나라도 성공이면 성공으로 간주
+  const anySuccess = results.some(r => r.ok);
+  if (anySuccess) {
+    console.info(`[SEND] ${kind} ${uniqueId} sent to at least one channel`);
     return true;
-  } catch (err) {
-    console.error('[SEND] embed send failed, not persisting', err?.message || err);
-    return false;
   }
+
+  // 5) 모두 실패한 경우: 로그, 옵션에 따라 롤백
+  console.error(`[SEND] ${kind} ${uniqueId} failed to send to all channels`, results);
+  if (CONFIG.ROLLBACK_ON_FAILURE) {
+    try {
+      sent[kind].delete(uniqueId);
+      await persistSentStateToFiles();
+      console.info(`[STATE] Rolled back ${kind} ${uniqueId} after send failure`);
+    } catch (e) {
+      console.error('[STATE] rollback failed', e?.message || e);
+    }
+  } else {
+    console.warn('[SEND] 기록은 유지됩니다 (ROLLBACK_ON_FAILURE=false)');
+  }
+  return false;
 }
 
 /* =========================
@@ -351,8 +421,8 @@ async function fetchKMA() {
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
 
         const mentionEveryone = Number.isFinite(mag) && mag >= 4.0;
-        // 전송 성공 시에만 저장
-        await sendEmbedAndPersist('kma', uniqueId, embed, mentionEveryone);
+        // 변경: 이벤트 수신 즉시 기록 후 전송 시도
+        await sendEmbedAfterMark('kma', uniqueId, embed, mentionEveryone);
       } catch (innerErr) {
         console.error('[KMA ITEM ERROR]', innerErr?.message || innerErr);
       }
@@ -421,7 +491,7 @@ async function fetchJMA() {
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
 
         const mentionEveryone = intensity >= 5;
-        await sendEmbedAndPersist('jma', id, embed, mentionEveryone);
+        await sendEmbedAfterMark('jma', id, embed, mentionEveryone);
       } catch (innerErr) {
         console.error('[JMA ITEM ERROR]', innerErr?.message || innerErr);
       }
