@@ -1,9 +1,8 @@
 /*************************************************
  * Earthquake Alert Discord Bot (완전판)
- * - 이벤트 수신 즉시 기록(mark) 후 전송 시도
- * - 기본 ROLLBACK_ON_FAILURE = true
- * - 채널별 재시도(지수 백오프), 개별 채널 실패는 전체 실패로 간주하지 않음
- * - 발생시각 포맷 안정화: KMA YYYYMMDDHHmmss 파싱 지원 + fallback
+ * - 기상청(KMA) / 일본기상청(JMA) / 안전안내문자(NDMS V2) 통합
+ * - KMA <rem> 분석을 통한 국가별 임베드 분기
+ * - Render 아웃바운드 IP 확인 지원 (/health)
  *************************************************/
 
 import 'dotenv/config';
@@ -27,12 +26,14 @@ const {
   APPLICATION_ID,
   OWNER_ID,
   PORT,
-  CHANNEL_IDS, // optional: comma separated channel IDs
+  CHANNEL_ID,
+  CHANNEL_IDS,
   POLL_INTERVAL_MS,
   KMA_RECENT_MINUTES,
   NUM_ROWS,
   SENT_DIR,
   KMA_KEY,
+  SAFETY_KEY, // 국민재난안전포털 API 키
   SEND_MAX_RETRIES,
   SEND_RETRY_BASE_MS,
   ROLLBACK_ON_FAILURE
@@ -50,22 +51,26 @@ const CONFIG = {
   ROLLBACK_ON_FAILURE: (ROLLBACK_ON_FAILURE === undefined) ? true : (ROLLBACK_ON_FAILURE === 'true')
 };
 
-if (!DISCORD_TOKEN || !APPLICATION_ID || !OWNER_ID) {
-  console.error('[ENV] DISCORD_TOKEN, APPLICATION_ID, OWNER_ID are required');
+if (!DISCORD_TOKEN) {
+  console.error('[ENV] DISCORD_TOKEN is required');
   process.exit(1);
 }
 
 /* =========================
-   HTTP (health)
+   HTTP (health & IP check)
 ========================= */
 const app = express();
 let lastPollAt = null;
 let lastPollStatus = 'idle';
 
 app.get('/', (_, res) => res.status(200).send('Bot is running'));
-app.get('/health', (_, res) => {
+app.get('/health', async (_, res) => {
+  // Render 등의 서버에서 아웃바운드 IP를 확인하기 위한 로직
+  const ipRes = await axios.get('https://api.ipify.org?format=json').catch(() => ({ data: { ip: 'unknown' } }));
+  
   const payload = {
     status: 'ok',
+    outbound_ip: ipRes.data.ip, // 공공데이터포털에 등록할 IP
     uptime_seconds: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
     last_poll_at: lastPollAt ? new Date(lastPollAt).toISOString() : null,
@@ -92,9 +97,10 @@ const client = new Client({
 /* =========================
    STATE (file-based)
 ========================= */
-const sent = { kma: new Set(), jma: new Set() };
+const sent = { kma: new Set(), jma: new Set(), ndms: new Set() };
 const SENT_KMA_PATH = path.join(CONFIG.SENT_DIR, 'sent-kma.json');
 const SENT_JMA_PATH = path.join(CONFIG.SENT_DIR, 'sent-jma.json');
+const SENT_NDMS_PATH = path.join(CONFIG.SENT_DIR, 'sent-ndms.json');
 
 async function ensureSentDir() {
   try {
@@ -112,43 +118,34 @@ async function atomicWriteFile(filePath, data) {
 
 async function ensureSentFilesExist() {
   await ensureSentDir();
-  try {
-    await fs.access(SENT_KMA_PATH).catch(async () => {
-      await atomicWriteFile(SENT_KMA_PATH, JSON.stringify([], null, 2));
-      console.info('[STATE] Created empty', SENT_KMA_PATH);
-    });
-    await fs.access(SENT_JMA_PATH).catch(async () => {
-      await atomicWriteFile(SENT_JMA_PATH, JSON.stringify([], null, 2));
-      console.info('[STATE] Created empty', SENT_JMA_PATH);
-    });
-  } catch (e) {
-    console.error('[STATE] ensureSentFilesExist error', e?.message || e);
+  const files = [SENT_KMA_PATH, SENT_JMA_PATH, SENT_NDMS_PATH];
+  for (const file of files) {
+    try {
+      await fs.access(file);
+    } catch {
+      await atomicWriteFile(file, JSON.stringify([], null, 2));
+      console.info('[STATE] Created empty', file);
+    }
   }
 }
 
 async function loadSentStateFromFiles() {
   await ensureSentFilesExist();
-  try {
-    const rawKma = await fs.readFile(SENT_KMA_PATH, 'utf8').catch(() => null);
-    if (rawKma) {
-      const parsed = JSON.parse(rawKma);
-      if (Array.isArray(parsed)) parsed.forEach(id => sent.kma.add(id));
-      console.info('[STATE] Loaded KMA sent IDs', SENT_KMA_PATH);
-    }
-  } catch (e) {
-    console.warn('[STATE] load KMA failed', e?.message || e);
-  }
+  
+  const loadState = async (path, key, name) => {
+    try {
+      const raw = await fs.readFile(path, 'utf8').catch(() => null);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) parsed.forEach(id => sent[key].add(id));
+        console.info(`[STATE] Loaded ${name} sent IDs`);
+      }
+    } catch (e) { console.warn(`[STATE] load ${name} failed`, e?.message || e); }
+  };
 
-  try {
-    const rawJma = await fs.readFile(SENT_JMA_PATH, 'utf8').catch(() => null);
-    if (rawJma) {
-      const parsed = JSON.parse(rawJma);
-      if (Array.isArray(parsed)) parsed.forEach(id => sent.jma.add(id));
-      console.info('[STATE] Loaded JMA sent IDs', SENT_JMA_PATH);
-    }
-  } catch (e) {
-    console.warn('[STATE] load JMA failed', e?.message || e);
-  }
+  await loadState(SENT_KMA_PATH, 'kma', 'KMA');
+  await loadState(SENT_JMA_PATH, 'jma', 'JMA');
+  await loadState(SENT_NDMS_PATH, 'ndms', 'NDMS');
 }
 
 let persistTimer = null;
@@ -157,6 +154,7 @@ async function persistSentStateToFiles() {
   try {
     await atomicWriteFile(SENT_KMA_PATH, JSON.stringify(Array.from(sent.kma), null, 2));
     await atomicWriteFile(SENT_JMA_PATH, JSON.stringify(Array.from(sent.jma), null, 2));
+    await atomicWriteFile(SENT_NDMS_PATH, JSON.stringify(Array.from(sent.ndms), null, 2));
     console.info('[STATE] Persisted sent-state to disk');
   } catch (e) {
     console.error('[STATE] persist failed', e?.message || e);
@@ -173,7 +171,7 @@ function schedulePeriodicPersist() {
 /* =========================
    UTIL
 ========================= */
-const isOwner = id => id === OWNER_ID;
+const isOwner = id => Boolean(OWNER_ID) && id === OWNER_ID;
 
 const api = axios.create({
   timeout: 10_000,
@@ -184,7 +182,21 @@ const DEFAULT_CHANNEL_IDS = [
   '1460620799055495352',
   '1468559204217520150'
 ];
-const CHANNEL_IDS_LIST = (CHANNEL_IDS && CHANNEL_IDS.split(',').map(s => s.trim()).filter(Boolean)) || DEFAULT_CHANNEL_IDS;
+
+function parseChannelIds(value) {
+  if (!value) return [];
+  return String(value).split(',').map(v => v.trim()).filter(Boolean);
+}
+
+const parsedChannelIds = parseChannelIds(CHANNEL_IDS);
+const parsedLegacyChannelId = parseChannelIds(CHANNEL_ID);
+const CHANNEL_IDS_LIST = (
+  parsedChannelIds.length > 0
+    ? parsedChannelIds
+    : parsedLegacyChannelId.length > 0
+      ? parsedLegacyChannelId
+      : DEFAULT_CHANNEL_IDS
+);
 
 const channelCache = new Map();
 
@@ -206,8 +218,6 @@ async function getChannel(channelId) {
 
 /* =========================
    TIME PARSERS
-   - KMA: YYYYMMDDHHmmss (e.g., 20260209103329)
-   - fallback: Date.parse
 ========================= */
 function parseKmaTime(str) {
   if (!str) return NaN;
@@ -236,8 +246,6 @@ function parseGenericTime(str) {
 /* =========================
    MARK & SEND 로직
 ========================= */
-
-// 즉시 마킹 및 원자적 저장 (이벤트 수신 즉시 호출)
 async function markSentImmediate(kind, uniqueId) {
   try {
     sent[kind].add(uniqueId);
@@ -248,7 +256,6 @@ async function markSentImmediate(kind, uniqueId) {
   }
 }
 
-// 채널별 전송 시도 (재시도 포함)
 async function sendToChannelWithRetries(channel, payload, maxRetries = CONFIG.SEND_MAX_RETRIES) {
   let attempt = 0;
   while (attempt <= maxRetries) {
@@ -265,60 +272,42 @@ async function sendToChannelWithRetries(channel, payload, maxRetries = CONFIG.SE
       const isRateLimit = /429|rate limit/i.test(msg);
       const backoff = CONFIG.SEND_RETRY_BASE_MS * Math.pow(2, attempt - 1) * (isRateLimit ? 2 : 1);
       console.warn(`[DISCORD SEND] 채널 전송 실패 (attempt ${attempt}/${maxRetries})`, msg);
-      if (attempt > maxRetries) {
-        return { ok: false, error: msg };
-      }
+      if (attempt > maxRetries) return { ok: false, error: msg };
       await new Promise(res => setTimeout(res, backoff));
     }
   }
   return { ok: false, error: 'unknown' };
 }
 
-// 마킹 후 전송: 이벤트 받자마자 기록하고 전송 시도
 async function sendEmbedAfterMark(kind, uniqueId, embed, everyone = false) {
-  // 1) 즉시 마킹 및 디스크 저장
   await markSentImmediate(kind, uniqueId);
 
-  // 2) 전송 페이로드 준비
   const payload = {
     content: everyone ? '@everyone' : undefined,
     embeds: [embed],
     allowedMentions: { parse: everyone ? ['everyone'] : [] }
   };
 
-  // 3) 채널별 전송 병렬 처리
   const results = await Promise.all(
     CHANNEL_IDS_LIST.map(async channelId => {
       const channel = await getChannel(channelId);
-      if (!channel) {
-        console.warn('[DISCORD] 채널 없음', channelId);
-        return { channelId, ok: false, error: 'no-channel' };
-      }
+      if (!channel) return { channelId, ok: false, error: 'no-channel' };
       try {
         const res = await sendToChannelWithRetries(channel, payload);
         if (res.ok) {
-          console.info('[DISCORD] 메시지 전송 완료', channelId);
+          console.info(`[DISCORD] 메시지 전송 완료 (${kind})`, channelId);
           return { channelId, ok: true };
         } else {
-          console.warn('[DISCORD] 메시지 전송 실패', channelId, res.error);
           return { channelId, ok: false, error: res.error };
         }
       } catch (err) {
-        console.error('[DISCORD] 채널 전송 예외', channelId, err?.message || err);
         return { channelId, ok: false, error: err?.message || err };
       }
     })
   );
 
-  // 4) 결과 평가: 하나라도 성공이면 성공으로 간주
-  const anySuccess = results.some(r => r.ok);
-  if (anySuccess) {
-    console.info(`[SEND] ${kind} ${uniqueId} sent to at least one channel`);
-    return true;
-  }
+  if (results.some(r => r.ok)) return true;
 
-  // 5) 모두 실패한 경우: 로그, 옵션에 따라 롤백
-  console.error(`[SEND] ${kind} ${uniqueId} failed to send to all channels`, results);
   if (CONFIG.ROLLBACK_ON_FAILURE) {
     try {
       sent[kind].delete(uniqueId);
@@ -327,18 +316,15 @@ async function sendEmbedAfterMark(kind, uniqueId, embed, everyone = false) {
     } catch (e) {
       console.error('[STATE] rollback failed', e?.message || e);
     }
-  } else {
-    console.warn('[SEND] 기록은 유지됩니다 (ROLLBACK_ON_FAILURE=false)');
   }
   return false;
 }
 
 /* =========================
-   DATE HELPERS
+   DATE & MAP HELPERS
 ========================= */
 function pad(n) { return String(n).padStart(2, '0'); }
 
-// KMA expects YYYYMMDD in KST
 function getYYYYMMDDForKST(date = new Date()) {
   const utc = date.getTime() + (date.getTimezoneOffset() * 60000);
   const kst = new Date(utc + 9 * 60 * 60 * 1000);
@@ -353,64 +339,33 @@ function getTodayRangeKMA() {
   return { from: yyyyMMdd, to: yyyyMMdd };
 }
 
-function nowMs() { return Date.now(); }
-
-/* =========================
-   MAP LINK HELPER
-========================= */
 function getMapLink(lat, lon, place) {
   if (lat != null && lon != null && lat !== '' && lon !== '') {
     return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${lat},${lon}`)}`;
   }
-  if (place) {
-    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}`;
-  }
+  if (place) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}`;
   return null;
 }
 
 /* =========================
-   KMA FETCH (KMA_KEY from env)
+   KMA FETCH (지진)
 ========================= */
 const KMA_URL_BASE = 'http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg';
-const KMA_RECENT_WINDOW_MS = CONFIG.KMA_RECENT_MINUTES * 60 * 1000;
 
 async function fetchKMA() {
-  if (!KMA_KEY) {
-    console.info('[KMA] KMA_KEY not provided, skipping KMA fetch');
-    return;
-  }
-
+  if (!KMA_KEY) return;
   const { from, to } = getTodayRangeKMA();
 
   try {
     const r = await api.get(KMA_URL_BASE, {
-      params: {
-        serviceKey: KMA_KEY,
-        numOfRows: CONFIG.NUM_ROWS,
-        pageNo: 1,
-        dataType: 'JSON',
-        fromTmFc: from,
-        toTmFc: to
-      }
+      params: { serviceKey: KMA_KEY, numOfRows: CONFIG.NUM_ROWS, pageNo: 1, dataType: 'JSON', fromTmFc: from, toTmFc: to }
     });
 
-    if (r.status === 429) {
-      console.warn('[KMA] 429 Too Many Requests, skipping this poll');
-      return;
-    }
-    if (r.status < 200 || r.status >= 300) {
-      console.warn('[KMA] unexpected status', r.status);
-      return;
-    }
-
+    if (r.status === 429 || r.status >= 300) return;
     const items = r.data?.response?.body?.items?.item;
-    if (!Array.isArray(items)) {
-      console.info('[KMA] No items in response');
-      return;
-    }
+    if (!Array.isArray(items)) return;
 
-    const now = nowMs();
-
+    const now = Date.now();
     for (const e of items) {
       try {
         if (!e?.tmEqk || !e?.loc) continue;
@@ -419,29 +374,44 @@ async function fetchKMA() {
         if (sent.kma.has(uniqueId)) continue;
 
         const t = parseKmaTime(String(e.tmEqk));
-        if (!Number.isFinite(t)) {
-          console.warn('[KMA] 발생시각 파싱 실패, 스킵:', e.tmEqk);
-          continue;
-        }
-        if (now - t > KMA_RECENT_WINDOW_MS) continue;
+        if (!Number.isFinite(t) || (now - t > CONFIG.KMA_RECENT_MINUTES * 60 * 1000)) continue;
 
         const mag = Number(e.mt);
-        const color = mag >= 5 ? 0xd32f2f : mag >= 4 ? 0xf57c00 : 0x1976d2;
+        const rem = e.rem ? String(e.rem) : '';
+        
+        // 국가별 임베드 분기 처리 로직
+        let isJapan = rem.includes('일본기상청') || rem.includes('JMA');
+        let isForeign = !isJapan && (rem.includes('미국지질조사소') || rem.includes('USGS') || rem.includes('국외') || rem.includes('해외'));
+
+        let embedTitle = '🌏 지진 발생 (대한민국)';
+        let embedColor = mag >= 5 ? 0xd32f2f : mag >= 4 ? 0xf57c00 : 0x1976d2; // 기본: 붉은색/주황색/파란색
+        let embedFooter = 'KMA / 기상청';
+
+        if (isJapan) {
+          embedTitle = '🌋 지진 발생 (일본)';
+          embedFooter = 'KMA (일본기상청 분석 결과)';
+        } else if (isForeign) {
+          embedTitle = '🌍 국외 지진 발생';
+          embedColor = 0x607d8b; // 회청색 (국외 지진 범용)
+          embedFooter = 'KMA (국외 분석 기관 결과)';
+        }
+
         const embed = new EmbedBuilder()
-          .setTitle('🌏 지진 발생 (대한민국)')
-          .setColor(color)
+          .setTitle(embedTitle)
+          .setColor(embedColor)
           .addFields(
             { name: '📍 위치', value: String(e.loc), inline: false },
             { name: '📏 규모', value: Number.isFinite(mag) ? `**${mag.toFixed(1)}**` : '정보 없음', inline: true },
             { name: '🕒 발생시각', value: new Date(t).toISOString(), inline: true }
           )
-          .setFooter({ text: 'KMA / 기상청' });
+          .setFooter({ text: embedFooter })
+          .setTimestamp(new Date(t));
 
-        embed.setTimestamp(new Date(t));
+        if (rem) {
+          embed.addFields({ name: '📝 참고사항', value: rem, inline: false });
+        }
 
-        const lat = e.lat ?? e.latitude ?? null;
-        const lon = e.lon ?? e.longitude ?? null;
-        const mapLink = getMapLink(lat, lon, e.loc);
+        const mapLink = getMapLink(e.lat ?? e.latitude ?? null, e.lon ?? e.longitude ?? null, e.loc);
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
 
         const mentionEveryone = Number.isFinite(mag) && mag >= 4.0;
@@ -456,31 +426,17 @@ async function fetchKMA() {
 }
 
 /* =========================
-   JMA FETCH
+   JMA FETCH (일본 지진)
 ========================= */
 const JMA_URL = 'https://www.jma.go.jp/bosai/quake/data/list.json';
-const JMA_RECENT_WINDOW_MS = CONFIG.KMA_RECENT_MINUTES * 60 * 1000;
 
 async function fetchJMA() {
   try {
     const r = await api.get(JMA_URL);
+    if (r.status === 429 || r.status >= 300) return;
+    if (!Array.isArray(r.data)) return;
 
-    if (r.status === 429) {
-      console.warn('[JMA] 429 Too Many Requests, skipping this poll');
-      return;
-    }
-    if (r.status < 200 || r.status >= 300) {
-      console.warn('[JMA] unexpected status', r.status);
-      return;
-    }
-
-    if (!Array.isArray(r.data)) {
-      console.info('[JMA] No items in response');
-      return;
-    }
-
-    const now = nowMs();
-
+    const now = Date.now();
     for (const e of r.data) {
       try {
         if (!e?.time || !e?.place) continue;
@@ -488,15 +444,12 @@ async function fetchJMA() {
         if (sent.jma.has(id)) continue;
 
         const t = parseGenericTime(e.time);
-        if (!Number.isFinite(t)) {
-          console.warn('[JMA] 발생시각 파싱 실패, 스킵:', e.time);
-          continue;
-        }
-        if (now - t > JMA_RECENT_WINDOW_MS) continue;
+        if (!Number.isFinite(t) || (now - t > CONFIG.KMA_RECENT_MINUTES * 60 * 1000)) continue;
 
         const intensity = Number(e.maxi || 0);
         const mag = Number(e.mag);
         const color = intensity >= 5 ? 0xd32f2f : intensity >= 4 ? 0xf57c00 : 0x1976d2;
+        
         const embed = new EmbedBuilder()
           .setTitle('🌋 지진 발생 (일본)')
           .setColor(color)
@@ -506,9 +459,8 @@ async function fetchJMA() {
             { name: '💥 최대진도', value: e.maxi ? String(e.maxi) : '정보 없음', inline: true },
             { name: '🕒 발생시각', value: new Date(t).toISOString(), inline: true }
           )
-          .setFooter({ text: 'JMA / Japan Meteorological Agency' });
-
-        embed.setTimestamp(new Date(t));
+          .setFooter({ text: 'JMA / Japan Meteorological Agency' })
+          .setTimestamp(new Date(t));
 
         const mapLink = getMapLink(e.lat ?? null, e.lon ?? null, e.place);
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
@@ -525,6 +477,55 @@ async function fetchJMA() {
 }
 
 /* =========================
+   SAFETY DATA FETCH (안전안내문자 V2)
+========================= */
+const SAFETY_URL = 'https://safetydata.go.kr/V2/api/DSSP-IF-00247';
+
+async function fetchSafetyAlerts() {
+  if (!SAFETY_KEY) return;
+
+  try {
+    const r = await api.get(SAFETY_URL, {
+      params: { serviceKey: SAFETY_KEY, returnType: 'json', numOfRows: 10, pageNo: 1 }
+    });
+
+    const items = r.data?.body?.[0]?.data || r.data?.body;
+    if (!Array.isArray(items)) return;
+
+    for (const e of items) {
+      try {
+        const uniqueId = String(e.MD101_SN || e.SN);
+        if (!uniqueId || uniqueId === 'undefined') continue;
+        if (sent.ndms.has(uniqueId)) continue;
+
+        const msgCn = String(e.MSG_CN || e.msg || '내용 없음');
+        
+        // 안전안내문자는 멘션 X, 긴급/위급재난문자는 @everyone
+        const isUrgent = msgCn.includes('긴급재난문자') || msgCn.includes('위급재난문자');
+        const title = isUrgent ? '🚨 긴급/위급 재난 문자' : '📢 안전 안내 문자';
+        const color = isUrgent ? 0xd32f2f : 0xFFB400; // 빨강(긴급) or 주황/노랑(안전)
+
+        const embed = new EmbedBuilder()
+          .setTitle(title)
+          .setColor(color)
+          .setDescription(msgCn)
+          .addFields(
+            { name: '📍 수신 지역', value: String(e.RCPTN_RGN_NM || e.locationName || '전국'), inline: true },
+            { name: '🕒 발송 시각', value: String(e.CRT_DT || e.create_date || '정보 없음'), inline: true }
+          )
+          .setFooter({ text: '행정안전부 국민재난안전포털' });
+
+        await sendEmbedAfterMark('ndms', uniqueId, embed, isUrgent);
+      } catch (innerErr) {
+        console.error('[SAFETY ITEM ERROR]', innerErr?.message || innerErr);
+      }
+    }
+  } catch (err) {
+    console.error('[SAFETY ERROR]', err?.message || err);
+  }
+}
+
+/* =========================
    SCHEDULER
 ========================= */
 let pollInFlight = false;
@@ -537,7 +538,8 @@ async function pollOnce() {
   lastPollAt = Date.now();
   lastPollStatus = 'running';
   try {
-    await Promise.allSettled([fetchKMA(), fetchJMA()]);
+    // 세 가지 API 모두 동시 호출
+    await Promise.allSettled([fetchKMA(), fetchJMA(), fetchSafetyAlerts()]);
     lastPollStatus = 'ok';
   } catch (err) {
     lastPollStatus = 'error';
@@ -576,6 +578,7 @@ const commands = [
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
 async function registerCommands() {
+  if (!APPLICATION_ID) return;
   try {
     await rest.put(Routes.applicationCommands(APPLICATION_ID), { body: commands });
     console.info('[DISCORD] Slash commands registered');
@@ -590,6 +593,7 @@ async function registerCommands() {
 client.on('interactionCreate', async interaction => {
   try {
     if (!interaction.isChatInputCommand()) return;
+    if (!OWNER_ID) return interaction.reply({ content: 'OWNER_ID 미설정: 관리자 명령어를 사용할 수 없습니다.', ephemeral: true });
     if (!isOwner(interaction.user.id)) return interaction.reply({ content: '권한 없음', ephemeral: true });
 
     if (interaction.commandName === '상태') {
@@ -601,6 +605,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.commandName === '청소') {
       sent.kma.clear();
       sent.jma.clear();
+      sent.ndms.clear();
       channelCache.clear();
       await persistSentStateToFiles();
       await interaction.reply('🧹 캐시 초기화 완료');
@@ -623,16 +628,11 @@ client.on('interactionCreate', async interaction => {
 ========================= */
 client.once('ready', async () => {
   console.info(`로그인 완료: ${client.user.tag}`);
+  console.info('[DISCORD] target channels', CHANNEL_IDS_LIST);
   await registerCommands();
 
   await loadSentStateFromFiles();
   schedulePeriodicPersist();
-
-  try {
-    await Promise.allSettled([fetchKMA(), fetchJMA()]);
-  } catch (e) {
-    console.error('[STARTUP FETCH ERROR]', e?.message || e);
-  }
 
   startPolling();
 });
@@ -640,12 +640,8 @@ client.once('ready', async () => {
 /* =========================
    GLOBAL ERROR HANDLING
 ========================= */
-process.on('unhandledRejection', err => {
-  console.error('[UNHANDLED REJECTION]', err?.stack || err);
-});
-process.on('uncaughtException', err => {
-  console.error('[UNCAUGHT EXCEPTION]', err?.stack || err);
-});
+process.on('unhandledRejection', err => console.error('[UNHANDLED REJECTION]', err?.stack || err));
+process.on('uncaughtException', err => console.error('[UNCAUGHT EXCEPTION]', err?.stack || err));
 
 /* =========================
    LOGIN
@@ -664,35 +660,24 @@ async function shutdown(signal) {
   stopPolling();
 
   try {
-    if (persistTimer) {
-      clearInterval(persistTimer);
-      persistTimer = null;
-    }
+    if (persistTimer) { clearInterval(persistTimer); persistTimer = null; }
     await persistSentStateToFiles();
-  } catch (e) {
-    console.warn('[SHUTDOWN] Error persisting state', e?.message || e);
-  }
+  } catch (e) { console.warn('[SHUTDOWN] Error persisting state', e?.message || e); }
 
   try {
     if (client && client.destroy) {
       await client.destroy();
       console.info('[SHUTDOWN] Discord client destroyed');
     }
-  } catch (e) {
-    console.error('[SHUTDOWN] Error destroying Discord client', e?.message || e);
-  }
+  } catch (e) { console.error('[SHUTDOWN] Error destroying Discord client', e?.message || e); }
 
   try {
     server.close(() => {
       console.info('[SHUTDOWN] HTTP server closed');
       process.exit(0);
     });
-    setTimeout(() => {
-      console.warn('[SHUTDOWN] Forcing exit');
-      process.exit(0);
-    }, 5000);
+    setTimeout(() => process.exit(0), 5000);
   } catch (e) {
-    console.error('[SHUTDOWN] Error closing server', e?.message || e);
     process.exit(1);
   }
 }
