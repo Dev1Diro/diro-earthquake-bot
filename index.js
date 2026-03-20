@@ -2,6 +2,9 @@
  * Earthquake Alert Discord Bot (완전판)
  * - 기상청(KMA) / 일본기상청(JMA) / 안전안내문자(NDMS V2) 통합
  * - KMA <rem> 분석을 통한 국가별 임베드 분기
+ * - 한국/일본 규모 5.0 이상만 멘션, 국외 노멘션
+ * - 안전문자(멘션X) / 재난문자(@everyone 멘션) 구분
+ * - 안전문자 API 2분/3시간 스케줄링 및 2분 내 데이터 필터링
  * - Render 아웃바운드 IP 확인 지원 (/health)
  *************************************************/
 
@@ -33,7 +36,7 @@ const {
   NUM_ROWS,
   SENT_DIR,
   KMA_KEY,
-  SAFETY_KEY, // 국민재난안전포털 API 키
+  SAFETY_KEY,
   SEND_MAX_RETRIES,
   SEND_RETRY_BASE_MS,
   ROLLBACK_ON_FAILURE
@@ -70,7 +73,7 @@ app.get('/health', async (_, res) => {
   
   const payload = {
     status: 'ok',
-    outbound_ip: ipRes.data.ip, // 공공데이터포털에 등록할 IP
+    outbound_ip: ipRes.data.ip,
     uptime_seconds: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
     last_poll_at: lastPollAt ? new Date(lastPollAt).toISOString() : null,
@@ -341,9 +344,9 @@ function getTodayRangeKMA() {
 
 function getMapLink(lat, lon, place) {
   if (lat != null && lon != null && lat !== '' && lon !== '') {
-    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${lat},${lon}`)}`;
+    return `https://www.google.com/maps/search/?api=1&query=$?q=${encodeURIComponent(`${lat},${lon}`)}`;
   }
-  if (place) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}`;
+  if (place) return `https://www.google.com/maps/search/?api=1&query=$?q=${encodeURIComponent(place)}`;
   return null;
 }
 
@@ -379,21 +382,28 @@ async function fetchKMA() {
         const mag = Number(e.mt);
         const rem = e.rem ? String(e.rem) : '';
         
-        // 국가별 임베드 분기 처리 로직
         let isJapan = rem.includes('일본기상청') || rem.includes('JMA');
         let isForeign = !isJapan && (rem.includes('미국지질조사소') || rem.includes('USGS') || rem.includes('국외') || rem.includes('해외'));
 
         let embedTitle = '🌏 지진 발생 (대한민국)';
-        let embedColor = mag >= 5 ? 0xd32f2f : mag >= 4 ? 0xf57c00 : 0x1976d2; // 기본: 붉은색/주황색/파란색
+        let embedColor = mag >= 5 ? 0xd32f2f : mag >= 4 ? 0xf57c00 : 0x1976d2;
         let embedFooter = 'KMA / 기상청';
+        
+        // 멘션 로직 (한국, 일본은 규모 5 이상 멘션 / 국외는 무조건 멘션 X)
+        let mentionEveryone = false;
 
         if (isJapan) {
           embedTitle = '🌋 지진 발생 (일본)';
           embedFooter = 'KMA (일본기상청 분석 결과)';
+          mentionEveryone = Number.isFinite(mag) && mag >= 5.0;
         } else if (isForeign) {
           embedTitle = '🌍 국외 지진 발생';
-          embedColor = 0x607d8b; // 회청색 (국외 지진 범용)
+          embedColor = 0x607d8b;
           embedFooter = 'KMA (국외 분석 기관 결과)';
+          mentionEveryone = false; // 국외는 노멘션
+        } else {
+          // 대한민국 기본
+          mentionEveryone = Number.isFinite(mag) && mag >= 5.0;
         }
 
         const embed = new EmbedBuilder()
@@ -414,7 +424,6 @@ async function fetchKMA() {
         const mapLink = getMapLink(e.lat ?? e.latitude ?? null, e.lon ?? e.longitude ?? null, e.loc);
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
 
-        const mentionEveryone = Number.isFinite(mag) && mag >= 4.0;
         await sendEmbedAfterMark('kma', uniqueId, embed, mentionEveryone);
       } catch (innerErr) {
         console.error('[KMA ITEM ERROR]', innerErr?.message || innerErr);
@@ -465,7 +474,8 @@ async function fetchJMA() {
         const mapLink = getMapLink(e.lat ?? null, e.lon ?? null, e.place);
         if (mapLink) embed.addFields({ name: '🗺️ 지도', value: `[지도 보기](${mapLink})`, inline: false });
 
-        const mentionEveryone = intensity >= 5;
+        // 일본 지진 규모 5.0 이상일 때만 에브리원 멘션
+        const mentionEveryone = Number.isFinite(mag) && mag >= 5.0;
         await sendEmbedAfterMark('jma', id, embed, mentionEveryone);
       } catch (innerErr) {
         console.error('[JMA ITEM ERROR]', innerErr?.message || innerErr);
@@ -482,15 +492,22 @@ async function fetchJMA() {
 const SAFETY_URL = 'https://safetydata.go.kr/V2/api/DSSP-IF-00247';
 
 async function fetchSafetyAlerts() {
-  if (!SAFETY_KEY) return;
+  if (!SAFETY_KEY) return false;
 
   try {
     const r = await api.get(SAFETY_URL, {
       params: { serviceKey: SAFETY_KEY, returnType: 'json', numOfRows: 10, pageNo: 1 }
     });
 
+    // API 통신 실패
+    if (r.status >= 300) return false;
+
     const items = r.data?.body?.[0]?.data || r.data?.body;
-    if (!Array.isArray(items)) return;
+    
+    // 정상 응답이지만 데이터가 없는 경우도 통신 성공으로 간주
+    if (!Array.isArray(items)) return true;
+
+    const now = Date.now();
 
     for (const e of items) {
       try {
@@ -499,11 +516,22 @@ async function fetchSafetyAlerts() {
         if (sent.ndms.has(uniqueId)) continue;
 
         const msgCn = String(e.MSG_CN || e.msg || '내용 없음');
+        let crtDt = String(e.CRT_DT || e.create_date || '');
+
+        // 한국 시간 기준(KST) 파싱을 위해 포맷팅 (예: 2026/03/20 15:23:21 -> 2026-03-20T15:23:21+09:00)
+        let timeString = crtDt.replace(/\//g, '-').replace(' ', 'T') + '+09:00';
+        const t = new Date(timeString).getTime();
+
+        // 2분(120,000ms)이 지난 문자면 스킵
+        if (Number.isFinite(t) && (now - t > 2 * 60 * 1000)) continue;
+
+        // 재난문자와 안전문자 구분
+        const isDisaster = msgCn.includes('재난문자');
+        const title = isDisaster ? '🚨 긴급/위급 재난 문자' : '📢 안전 안내 문자';
+        const color = isDisaster ? 0xd32f2f : 0xFFB400; 
         
-        // 안전안내문자는 멘션 X, 긴급/위급재난문자는 @everyone
-        const isUrgent = msgCn.includes('긴급재난문자') || msgCn.includes('위급재난문자');
-        const title = isUrgent ? '🚨 긴급/위급 재난 문자' : '📢 안전 안내 문자';
-        const color = isUrgent ? 0xd32f2f : 0xFFB400; // 빨강(긴급) or 주황/노랑(안전)
+        // 재난문자만 에브리원 멘션, 안전문자는 멘션 X
+        const mentionEveryone = isDisaster;
 
         const embed = new EmbedBuilder()
           .setTitle(title)
@@ -511,17 +539,19 @@ async function fetchSafetyAlerts() {
           .setDescription(msgCn)
           .addFields(
             { name: '📍 수신 지역', value: String(e.RCPTN_RGN_NM || e.locationName || '전국'), inline: true },
-            { name: '🕒 발송 시각', value: String(e.CRT_DT || e.create_date || '정보 없음'), inline: true }
+            { name: '🕒 발송 시각', value: crtDt || '정보 없음', inline: true }
           )
           .setFooter({ text: '행정안전부 국민재난안전포털' });
 
-        await sendEmbedAfterMark('ndms', uniqueId, embed, isUrgent);
+        await sendEmbedAfterMark('ndms', uniqueId, embed, mentionEveryone);
       } catch (innerErr) {
         console.error('[SAFETY ITEM ERROR]', innerErr?.message || innerErr);
       }
     }
+    return true; // 성공적으로 처리됨
   } catch (err) {
-    console.error('[SAFETY ERROR]', err?.message || err);
+    console.error('[SAFETY API ERROR]', err?.message || err);
+    return false; // 네트워크 오류 등으로 실패
   }
 }
 
@@ -532,14 +562,14 @@ let pollInFlight = false;
 let pollIntervalHandle = null;
 let running = true;
 
+// 1. KMA/JMA 지진 정보 스케줄러 (POLL_INTERVAL_MS 주기)
 async function pollOnce() {
   if (!running || pollInFlight) return;
   pollInFlight = true;
   lastPollAt = Date.now();
   lastPollStatus = 'running';
   try {
-    // 세 가지 API 모두 동시 호출
-    await Promise.allSettled([fetchKMA(), fetchJMA(), fetchSafetyAlerts()]);
+    await Promise.allSettled([fetchKMA(), fetchJMA()]);
     lastPollStatus = 'ok';
   } catch (err) {
     lastPollStatus = 'error';
@@ -549,21 +579,50 @@ async function pollOnce() {
   }
 }
 
+// 2. 안전안내문자 스케줄러 (성공 시 2분, 실패 시 3시간)
+let ndmsTimer = null;
+async function loopNDMS() {
+  if (!running) return;
+
+  const success = await fetchSafetyAlerts();
+
+  if (success) {
+    // 성공: 2분 뒤 재호출 (120,000ms)
+    ndmsTimer = setTimeout(loopNDMS, 2 * 60 * 1000);
+  } else {
+    // 실패: 3시간 뒤 재호출 (10,800,000ms)
+    console.warn('[NDMS] API 요청 실패. 3시간 뒤 재시도합니다.');
+    ndmsTimer = setTimeout(loopNDMS, 3 * 60 * 60 * 1000);
+  }
+}
+
 function startPolling() {
-  if (pollIntervalHandle) return;
-  pollOnce().catch(e => console.error('[POLL] initial poll error', e?.message || e));
-  pollIntervalHandle = setInterval(() => {
-    pollOnce().catch(e => console.error('[POLL] poll error', e?.message || e));
-  }, CONFIG.POLL_INTERVAL_MS);
-  console.info('[SCHEDULER] Polling started', { interval_ms: CONFIG.POLL_INTERVAL_MS });
+  // 지진 정보 폴링 시작
+  if (!pollIntervalHandle) {
+    pollOnce().catch(e => console.error('[POLL] initial poll error', e?.message || e));
+    pollIntervalHandle = setInterval(() => {
+      pollOnce().catch(e => console.error('[POLL] poll error', e?.message || e));
+    }, CONFIG.POLL_INTERVAL_MS);
+    console.info('[SCHEDULER] Earthquake Polling started', { interval_ms: CONFIG.POLL_INTERVAL_MS });
+  }
+
+  // 안전안내문자 폴링 시작
+  if (!ndmsTimer) {
+    loopNDMS();
+    console.info('[SCHEDULER] NDMS Polling started (2min / 3hr loop)');
+  }
 }
 
 function stopPolling() {
   if (pollIntervalHandle) {
     clearInterval(pollIntervalHandle);
     pollIntervalHandle = null;
-    console.info('[SCHEDULER] Polling stopped');
   }
+  if (ndmsTimer) {
+    clearTimeout(ndmsTimer);
+    ndmsTimer = null;
+  }
+  console.info('[SCHEDULER] Polling stopped');
 }
 
 /* =========================
