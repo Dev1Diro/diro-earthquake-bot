@@ -1,21 +1,22 @@
 {
-  "name": "earthquake-alert-bot-compat",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Compatibility entrypoint that runs the root Discord earthquake bot",
+  "name": "earthquake-safety-bot",
+  "version": "1.1.0",
+  "description": "Earthquake and Safety Alert Discord Bot with NDMS, KMA, and JMA integration",
   "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "node --watch index.js"
   },
   "dependencies": {
     "axios": "^1.6.7",
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
-    "express": "^4.18.3"
+    "express": "^4.18.2"
   },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
-  }
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Gemini-Assistant",
+  "license": "MIT"
 }
