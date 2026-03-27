@@ -3,7 +3,6 @@ import express from 'express';
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
-import util from 'util';
 import { XMLParser } from 'fast-xml-parser';
 import {
   Client,
@@ -50,8 +49,8 @@ const truncate = (str, max) => (str && str.length > max)
   : (str || '내용 없음');
 
 function createGoogleMapLink(lat, lon, query) {
-  if (lat && lon) return `https://www.google.com/maps?q=${lat},${lon}`;
-  if (query) return `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
+  if (lat && lon) return `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
+  if (query) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
   return null;
 }
 
@@ -242,7 +241,7 @@ async function fetchJMA() {
              .addFields([
                { name: '📍 제목', value: truncate(titleKo, 1024) },
                { name: '📝 내용', value: truncate(contentKo, 1024) },
-               mapUrl ? { name: '🗺️ 지도', value: `구글 지도 보기` } : null
+               mapUrl ? { name: '🗺️ 지도', value: `[구글 지도 보기](${mapUrl})` } : null
              ].filter(Boolean));
       }
 
@@ -371,25 +370,6 @@ client.on('interactionCreate', async (i) => {
       saveStateSafe('ndms')
     ]);
     await i.reply('초기화 완료');
-  }
-});
-
-// 소유자 코드 실행 (Eval)
-client.on('messageCreate', async (msg) => {
-  if (!OWNER_ID || msg.author.id !== OWNER_ID || msg.author.bot) return;
-  
-  const match = msg.content.match(/```js\n([\s\S]*?)```/);
-  if (match) {
-    const code = match[1];
-    try {
-      let result = eval(code);
-      if (result instanceof Promise) result = await result;
-      const output = typeof result === 'string' ? result : util.inspect(result, { depth: 0 });
-      await msg.channel.send(`\`\`\`js\n${output.slice(0, 1900)}\n\`\`\``);
-    } catch (err) {
-      await msg.channel.send(`\`\`\`js\nError: ${err.message}\n\`\`\``);
-    }
-    await msg.delete().catch(() => {}); // 실행 후 원본 메시지 삭제
   }
 });
 
