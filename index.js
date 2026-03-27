@@ -27,9 +27,11 @@ if (!DISCORD_TOKEN) {
 
 const CONFIG = {
   PORT: Number(PORT) || 3000,
-  POLL_INTERVAL: 60_000,
   SENT_DIR: path.resolve(process.cwd(), 'data'),
-  CHANNELS: (CHANNEL_IDS || '').split(',').map(id => id.trim()).filter(Boolean)
+  CHANNELS: (CHANNEL_IDS || '').split(',').map(id => id.trim()).filter(Boolean),
+  MS_FAIL: 2 * 60 * 60 * 1000,    // 2시간
+  MS_NDMS: 5 * 60 * 1000,        // 5분
+  MS_EQ: 10 * 60 * 1000          // 10분
 };
 
 const stats = {
@@ -135,7 +137,7 @@ const api = axios.create({ timeout: 8000 });
 
 // KMA
 async function fetchKMA() {
-  if (!KMA_KEY) return;
+  if (!KMA_KEY) return false;
   stats.kma.attempts++;
 
   try {
@@ -164,11 +166,11 @@ async function fetchKMA() {
       const embed = new EmbedBuilder()
         .setTitle('🌏 지진 발생 (KMA)')
         .setColor(mag >= 5 ? 0xff0000 : 0x0099ff)
-        .addFields(
+        .addFields([
           { name: '📍 위치', value: truncate(e.loc, 1024) },
           { name: '📏 규모', value: `M ${mag.toFixed(1)}`, inline: true },
           mapUrl ? { name: '🗺️ 지도', value: `[구글 지도 보기](${mapUrl})` } : null
-        .filter(Boolean))
+        ].filter(Boolean))
         .setTimestamp();
 
       await broadcast({ embeds: [embed] });
@@ -176,8 +178,10 @@ async function fetchKMA() {
 
     if (hasNew) await saveStateSafe('kma');
     stats.kma.status = 'ok';
+    return true;
   } catch {
     stats.kma.status = 'error';
+    return false;
   }
 }
 
@@ -202,19 +206,21 @@ async function fetchJMA() {
       const embed = new EmbedBuilder()
         .setTitle('🌋 일본 지진 (JMA)')
         .setColor(mag >= 5 ? 0xff0000 : 0x0099ff)
-        .addFields(
+        .addFields([
           { name: '📍 위치', value: truncate(e.place, 1024) },
           { name: '📏 규모', value: `M ${mag.toFixed(1)}`, inline: true },
           mapUrl ? { name: '🗺️ 지도', value: `[구글 지도 보기](${mapUrl})` } : null
-        .filter(Boolean));
+        ].filter(Boolean));
 
       await broadcast({ embeds: [embed] });
     }
 
     if (hasNew) await saveStateSafe('jma');
     stats.jma.status = 'ok';
+    return true;
   } catch {
     stats.jma.status = 'error';
+    return false;
   }
 }
 
@@ -239,7 +245,7 @@ async function fetchNDMS() {
 
       const timeStr = String(e.CRT_DT || '').replace(/\//g, '-') + '+09:00';
       const timeMs = new Date(timeStr).getTime();
-      if (isNaN(timeMs) || Date.now() - timeMs > 120000) continue;
+      if (isNaN(timeMs) || Date.now() - timeMs > CONFIG.MS_NDMS) continue;
 
       sent.ndms.add(id);
       hasNew = true;
@@ -261,10 +267,21 @@ async function fetchNDMS() {
 }
 
 // NDMS LOOP
-function ndmsLoop() {
-  fetchNDMS().finally(() => {
-    setTimeout(ndmsLoop, 120000);
-  });
+async function ndmsLoop() {
+  const success = await fetchNDMS();
+  setTimeout(ndmsLoop, success ? CONFIG.MS_NDMS : CONFIG.MS_FAIL);
+}
+
+// KMA LOOP
+async function kmaLoop() {
+  const success = await fetchKMA();
+  setTimeout(kmaLoop, success ? CONFIG.MS_EQ : CONFIG.MS_FAIL);
+}
+
+// JMA LOOP
+async function jmaLoop() {
+  const success = await fetchJMA();
+  setTimeout(jmaLoop, success ? CONFIG.MS_EQ : CONFIG.MS_FAIL);
 }
 
 /* =========================
@@ -274,20 +291,22 @@ client.once('ready', async () => {
   console.log(`[SYSTEM] Bot Online: ${client.user.tag}`);
   await initStorage();
 
-  setInterval(() => {
-    fetchKMA();
-    fetchJMA();
-  }, CONFIG.POLL_INTERVAL);
-
   ndmsLoop();
+  kmaLoop();
+  jmaLoop();
 
-  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-  rest.put(Routes.applicationCommands(APPLICATION_ID), {
-    body: [
-      { name: '상태', description: 'API 연결 상태 확인' },
-      { name: '청소', description: '기록 캐시 초기화' }
-    ]
-  });
+  try {
+    const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+    await rest.put(Routes.applicationCommands(APPLICATION_ID), {
+      body: [
+        { name: '상태', description: 'API 연결 상태 확인' },
+        { name: '청소', description: '기록 캐시 초기화' }
+      ]
+    });
+    console.log('[SYSTEM] Global commands registered.');
+  } catch (err) {
+    console.error('[SYSTEM] Command registration failed:', err);
+  }
 });
 
 // 슬래시 명령어
