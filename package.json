@@ -5,9 +5,10 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
-  },
+  "start": "node index.js",
+  "dev": "node --watch index.js",
+  "build": "npm ci --only=production"
+},
   "dependencies": {
     "axios": "^1.13.6",
     "discord.js": "^14.25.1",
