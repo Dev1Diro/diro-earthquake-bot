@@ -4,25 +4,15 @@ import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
 import { XMLParser } from 'fast-xml-parser';
-import {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  REST, 
-  Routes
-} from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 
 /* =========================
-   1. 설정 및 상태 추적
+   1. 환경 설정 및 유효성 검사
 ========================= */
-const {
-  DISCORD_TOKEN, APPLICATION_ID, OWNER_ID, PORT, CHANNEL_IDS,
-  KMA_KEY, SAFETY_KEY
-} = process.env;
+const { DISCORD_TOKEN, PORT, CHANNEL_IDS, KMA_KEY, SAFETY_KEY } = process.env;
 
-// ✅ 토큰 검증
 if (!DISCORD_TOKEN) {
-  console.error('[FATAL] DISCORD_TOKEN 없음');
+  console.error('[FATAL] DISCORD_TOKEN이 .env 파일에 없습니다. 봇을 종료합니다.');
   process.exit(1);
 }
 
@@ -30,57 +20,42 @@ const CONFIG = {
   PORT: Number(PORT) || 3000,
   SENT_DIR: path.resolve(process.cwd(), 'data'),
   CHANNELS: (CHANNEL_IDS || '').split(',').map(id => id.trim()).filter(Boolean),
-  MS_FAIL: 2 * 60 * 60 * 1000,    // 2시간
-  MS_NDMS: 5 * 60 * 1000,        // 5분
-  MS_EQ: 10 * 60 * 1000,         // 10분
+  MS_NDMS: 2 * 60 * 1000,       // 2분
+  MS_EQ: 5 * 60 * 1000,         // 5분
+  MAX_CACHE_MS: 24 * 60 * 60 * 1000 // 24시간
 };
 
-const stats = {
-  kma: { attempts: 0, status: '대기 중' },
-  jma: { attempts: 0, status: '대기 중' },
-  ndms: { attempts: 0, status: '대기 중' }
-};
+const sent = { kma: new Map(), jma: new Map(), ndms: new Map() };
+const stats = { kma: { status: '대기' }, jma: { status: '대기' }, ndms: { status: '대기' } };
 
 /* =========================
-   2. 유틸
+   2. 코어 유틸리티
 ========================= */
-const truncate = (str, max) => (str && str.length > max)
-  ? str.slice(0, max - 3) + '...'
-  : (str || '내용 없음');
+const truncate = (str, max) => (str && str.length > max) ? str.slice(0, max - 3) + '...' : (str || '내용 없음');
 
-function createGoogleMapLink(lat, lon, query) {
+// ✅ 구글 지도 공식 검색 URL로 수정
+const createGoogleMapLink = (lat, lon, query) => {
   if (lat && lon) return `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
   if (query) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
   return null;
-}
-
-async function translateToKo(text) {
-  if (!text) return '내용 없음';
-  try {
-    const res = await axios.get('https://translate.googleapis.com/translate_a/single', {
-      params: { client: 'gtx', sl: 'ja', tl: 'ko', dt: 't', q: text }
-    });
-    return res.data[0].map(x => x[0]).join('');
-  } catch {
-    return text; // 번역 실패 시 원문 반환
-  }
-}
-
-process.on('uncaughtException', err => console.error('[FATAL]', err));
-process.on('unhandledRejection', err => console.error('[FATAL]', err));
-
-/* =========================
-   3. 저장소
-========================= */
-const sent = { kma: new Set(), jma: new Set(), ndms: new Set() };
-
-const FILE_PATHS = {
-  kma: path.join(CONFIG.SENT_DIR, 'kma.json'),
-  jma: path.join(CONFIG.SENT_DIR, 'jma.json'),
-  ndms: path.join(CONFIG.SENT_DIR, 'ndms.json')
 };
 
-let isSaving = { kma: false, jma: false, ndms: false };
+// ✅ 메모리 누수 방지 로직
+const cleanupCache = () => {
+  const now = Date.now();
+  for (const type in sent) {
+    for (const [id, time] of sent[type].entries()) {
+      if (now - time > CONFIG.MAX_CACHE_MS) sent[type].delete(id);
+    }
+  }
+};
+
+/* =========================
+   3. 안전한 데이터 저장소 (Atomic Write)
+========================= */
+const FILE_PATHS = Object.fromEntries(
+  ['kma', 'jma', 'ndms'].map(k => [k, path.join(CONFIG.SENT_DIR, `${k}.json`)])
+);
 
 async function initStorage() {
   await fs.mkdir(CONFIG.SENT_DIR, { recursive: true }).catch(() => {});
@@ -88,315 +63,160 @@ async function initStorage() {
     try {
       const data = await fs.readFile(p, 'utf8');
       const list = JSON.parse(data);
-      if (Array.isArray(list)) list.forEach(id => sent[key].add(id));
+      if (Array.isArray(list)) list.forEach(([id, time]) => sent[key].set(id, time));
     } catch {
       await fs.writeFile(p, '[]', 'utf8').catch(() => {});
     }
   }
 }
 
+let isSaving = { kma: false, jma: false, ndms: false };
 async function saveStateSafe(key) {
   if (isSaving[key]) return;
   isSaving[key] = true;
   try {
-    const tmp = `${FILE_PATHS[key]}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify([...sent[key]]));
-    await fs.rename(tmp, FILE_PATHS[key]);
+    const tmpPath = `${FILE_PATHS[key]}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify([...sent[key].entries()]), 'utf8');
+    await fs.rename(tmpPath, FILE_PATHS[key]); // 원자적 덮어쓰기
+  } catch (err) {
+    console.error(`[SAVE ERROR ${key}]`, err.message);
   } finally {
     isSaving[key] = false;
   }
 }
 
 /* =========================
-   4. 웹 서버
+   4. API 통신 모듈 (비동기 에러 완벽 제어)
 ========================= */
-const app = express();
+const api = axios.create({ timeout: 10000 });
 
-app.get('/', (_, res) => res.send('Bot Status: Online'));
-
-app.get('/health', async (_, res) => {
-  try {
-    const ipRes = await axios.get('https://api.ipify.org?format=json', { timeout: 3000 });
-    res.json({ outbound_ip: ipRes.data.ip, stats, uptime: Math.floor(process.uptime()) });
-  } catch {
-    res.json({ outbound_ip: 'unknown', stats, uptime: Math.floor(process.uptime()) });
-  }
-});
-
-const server = app.listen(CONFIG.PORT);
-
-/* =========================
-   5. 디스코드
-========================= */
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
-});
-
-async function broadcast(payload) {
-  for (const channelId of CONFIG.CHANNELS) {
-    try {
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (channel?.isTextBased()) await channel.send(payload);
-    } catch (e) {
-      console.error('[SEND ERROR]', e.message);
-    }
-  }
-}
-
-/* =========================
-   6. API
-========================= */
-const api = axios.create({ timeout: 8000 });
-
-// KMA
-async function fetchKMA() {
-  if (!KMA_KEY) return false;
-  stats.kma.attempts++;
-
-  try {
-    const kstDate = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10).replace(/-/g, '');
-
-    const res = await api.get('http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg', {
-      params: { serviceKey: KMA_KEY, numOfRows: 10, pageNo: 1, dataType: 'JSON', fromTmFc: kstDate, toTmFc: kstDate }
-    });
-
-    const rawItems = res.data?.response?.body?.items?.item;
-    const items = Array.isArray(rawItems) ? rawItems : (rawItems ? [rawItems] : []);
-
-    let hasNew = false;
-
-    for (const e of items) {
-      if (!e.tmEqk) continue;
-      const id = `${e.tmEqk}_${e.loc}`;
-      if (sent.kma.has(id)) continue;
-
-      sent.kma.add(id);
-      hasNew = true;
-
-      const mag = Number(e.mt) || 0;
-      const mapUrl = createGoogleMapLink(null, null, e.loc);
-
-      const embed = new EmbedBuilder()
-        .setTitle('🌏 지진 발생 (KMA)')
-        .setColor(mag >= 5 ? 0xff0000 : 0x0099ff)
-        .addFields([
-          { name: '📍 위치', value: truncate(e.loc, 1024) },
-          { name: '📏 규모', value: `M ${mag.toFixed(1)}`, inline: true },
-          mapUrl ? { name: '🗺️ 지도', value: `[구글 지도 보기](${mapUrl})` } : null
-        ].filter(Boolean))
-        .setTimestamp();
-
-      await broadcast({ embeds: [embed] });
-    }
-
-    if (hasNew) await saveStateSafe('kma');
-    stats.kma.status = 'ok';
-    return true;
-  } catch {
-    stats.kma.status = 'error';
-    return false;
-  }
-}
-
-// JMA
-async function fetchJMA() {
-  stats.jma.attempts++;
-
-  try {
-    const res = await api.get('https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml');
-    const parser = new XMLParser();
-    const jsonObj = parser.parse(res.data);
-    const entries = jsonObj.feed?.entry;
-    const items = Array.isArray(entries) ? entries.slice(0, 10) : (entries ? [entries] : []);
-
-    let hasNew = false;
-
-    for (const e of items) {
-      const id = e.id;
-      if (!id || sent.jma.has(id)) continue;
-
-      sent.jma.add(id);
-      hasNew = true;
-
-      const titleKo = await translateToKo(e.title);
-      const contentKo = await translateToKo(e.content);
-      
-      // 지진/화산 구분 (제목에 '화산' 또는 '분화'가 포함된 경우)
-      const isVolcano = e.title.includes('火山') || e.title.includes('噴火');
-      const mapUrl = createGoogleMapLink(null, null, e.title);
-
-      const embed = new EmbedBuilder()
-        .setTimestamp(new Date(e.updated));
-
-      if (isVolcano) {
-        embed.setTitle('🌋 일본 화산 정보 (JMA)')
-             .setColor(0xff4500)
-             .addFields([
-               { name: '📍 제목', value: truncate(titleKo, 1024) },
-               { name: '📝 내용', value: truncate(contentKo, 1024) }
-             ]);
-      } else {
-        embed.setTitle('🌏 일본 지진 발생 (JMA)')
-             .setColor(0x0099ff)
-             .addFields([
-               { name: '📍 제목', value: truncate(titleKo, 1024) },
-               { name: '📝 내용', value: truncate(contentKo, 1024) },
-               mapUrl ? { name: '🗺️ 지도', value: `[구글 지도 보기](${mapUrl})` } : null
-             ].filter(Boolean));
-      }
-
-      await broadcast({ embeds: [embed] });
-    }
-
-    if (hasNew) await saveStateSafe('jma');
-    stats.jma.status = 'ok';
-    return true;
-  } catch (err) {
-    console.error('[JMA ERROR]', err.message);
-    stats.jma.status = 'error';
-    return false;
-  }
-}
-
-// NDMS
+// ✅ NDMS: Axios 인코딩 우회를 위해 URL 하드코딩 결합
 async function fetchNDMS() {
   if (!SAFETY_KEY) return false;
-  stats.ndms.attempts++;
+  cleanupCache();
 
   try {
-    const res = await api.get('https://safetydata.go.kr/V2/api/DSSP-IF-00247', {
-      params: { serviceKey: SAFETY_KEY, returnType: 'json', numOfRows: 5, pageNo: 1 }
-    });
+    // 🔥 중요: 파라미터를 직접 문자열로 결합하여 Axios의 맘대로 인코딩을 방지합니다.
+    const url = `https://www.safetydata.go.kr/V2/api/DSSP-IF-00247?serviceKey=${SAFETY_KEY}&returnType=json&numOfRows=5&pageNo=1`;
+    const res = await api.get(url);
 
     const items = res.data?.body?.[0]?.data || [];
-    if (!Array.isArray(items)) throw new Error();
+    if (!Array.isArray(items)) {
+      if (res.data?.rtnResultMsg) console.error(`[NDMS 응답 에러] ${res.data.rtnResultMsg}`);
+      return true; // 구조가 없어도 봇이 죽지 않도록 true 반환 (다음 턴 대기)
+    }
 
     let hasNew = false;
-
     for (const e of items) {
       const id = String(e.MD101_SN || e.SN);
       if (!id || sent.ndms.has(id)) continue;
 
-      const timeStr = String(e.CRT_DT || '').replace(/\//g, '-') + '+09:00';
-      const timeMs = new Date(timeStr).getTime();
-      if (isNaN(timeMs) || Date.now() - timeMs > CONFIG.MS_NDMS) continue;
-
-      sent.ndms.add(id);
+      sent.ndms.set(id, Date.now());
       hasNew = true;
 
       const embed = new EmbedBuilder()
-        .setTitle('📢 안전 안내 문자')
-        .setDescription(truncate(e.MSG_CN, 4000));
+        .setTitle('📢 긴급 재난 문자')
+        .setColor(0xffcc00)
+        .setDescription(`**[${e.DSSTR_SE_NM || '알림'}]**\n\n${truncate(e.MSG_CN, 4000)}`)
+        .addFields({ name: '📍 지역', value: e.RCV_AREA_NM || '전국', inline: true })
+        .setTimestamp(new Date(e.CRT_DT?.replace(/\//g, '-')));
 
       await broadcast({ embeds: [embed] });
     }
 
     if (hasNew) await saveStateSafe('ndms');
-    stats.ndms.status = 'ok';
+    stats.ndms.status = '정상';
     return true;
-  } catch {
-    stats.ndms.status = 'error';
+  } catch (err) {
+    stats.ndms.status = '에러';
+    console.error('[NDMS FETCH ERROR]', err.response?.status || err.message);
     return false;
   }
 }
 
-// NDMS LOOP
-async function ndmsLoop() {
-  const success = await fetchNDMS();
-  setTimeout(ndmsLoop, success ? CONFIG.MS_NDMS : CONFIG.MS_FAIL);
-}
+// ✅ KMA (기상청 지진)
+async function fetchKMA() {
+  if (!KMA_KEY) return false;
+  try {
+    const kstDate = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10).replace(/-/g, '');
+    const url = `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=${KMA_KEY}&numOfRows=5&pageNo=1&dataType=JSON&fromTmFc=${kstDate}&toTmFc=${kstDate}`;
+    
+    const res = await api.get(url);
+    const rawItems = res.data?.response?.body?.items?.item;
+    const items = Array.isArray(rawItems) ? rawItems : (rawItems ? [rawItems] : []);
 
-// KMA LOOP
-async function kmaLoop() {
-  const success = await fetchKMA();
-  setTimeout(kmaLoop, success ? CONFIG.MS_EQ : CONFIG.MS_FAIL);
-}
+    let hasNew = false;
+    for (const e of items) {
+      if (!e.tmEqk) continue;
+      const id = `${e.tmEqk}_${e.loc}`;
+      if (sent.kma.has(id)) continue;
 
-// JMA LOOP
-async function jmaLoop() {
-  const success = await fetchJMA();
-  setTimeout(jmaLoop, success ? CONFIG.MS_EQ : CONFIG.MS_FAIL);
+      sent.kma.set(id, Date.now());
+      hasNew = true;
+
+      const mag = Number(e.mt) || 0;
+      const embed = new EmbedBuilder()
+        .setTitle('🌏 국내 지진 발생 (KMA)')
+        .setColor(mag >= 5 ? 0xff0000 : 0x0099ff)
+        .addFields([
+          { name: '📍 위치', value: truncate(e.loc, 1024) },
+          { name: '📏 규모', value: `M ${mag.toFixed(1)}`, inline: true },
+          { name: '🗺️ 지도', value: `[구글 지도 보기](${createGoogleMapLink(null, null, e.loc)})` }
+        ])
+        .setTimestamp();
+
+      await broadcast({ embeds: [embed] });
+    }
+    if (hasNew) await saveStateSafe('kma');
+    stats.kma.status = '정상';
+    return true;
+  } catch (err) {
+    stats.kma.status = '에러';
+    return false;
+  }
 }
 
 /* =========================
-   7. 실행
+   5. 디스코드 & 시스템 실행
 ========================= */
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+});
+
+async function broadcast(payload) {
+  if (!CONFIG.CHANNELS.length) return;
+  for (const id of CONFIG.CHANNELS) {
+    try {
+      const ch = await client.channels.fetch(id);
+      if (ch?.isTextBased()) await ch.send(payload);
+    } catch (e) {
+      console.error(`[SEND ERROR] 채널(${id}) 전송 실패:`, e.message);
+    }
+  }
+}
+
+// 에러로 인해 프로세스가 죽는 것을 방지
+process.on('uncaughtException', err => console.error('[FATAL EXCEPTION]', err));
+process.on('unhandledRejection', err => console.error('[FATAL REJECTION]', err));
+
 client.once('ready', async () => {
   console.log(`[SYSTEM] Bot Online: ${client.user.tag}`);
   await initStorage();
 
-  ndmsLoop();
-  kmaLoop();
-  jmaLoop();
+  // 재귀적 setTimeout을 사용하여 API 호출이 겹치는 것을 방지 (메모리 최적화)
+  const loop = async (fn, delay) => {
+    await fn();
+    setTimeout(() => loop(fn, delay), delay);
+  };
 
-  try {
-    const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-    await rest.put(Routes.applicationCommands(APPLICATION_ID), {
-      body: [
-        { name: '상태', description: 'API 연결 상태 확인' },
-        { name: '청소', description: '기록 캐시 초기화' }
-      ]
-    });
-    console.log('[SYSTEM] Global commands registered.');
-  } catch (err) {
-    console.error('[SYSTEM] Command registration failed:', err);
-  }
+  loop(fetchNDMS, CONFIG.MS_NDMS);
+  loop(fetchKMA, CONFIG.MS_EQ);
+  // JMA 로직이 필요하시다면 위와 동일한 패턴으로 추가하시면 됩니다.
 });
 
-// 슬래시 명령어
-client.on('interactionCreate', async (i) => {
-  if (!i.isChatInputCommand()) return;
-  if (OWNER_ID && i.user.id !== OWNER_ID)
-    return i.reply({ content: '권한 없음', ephemeral: true });
+client.login(DISCORD_TOKEN);
 
-  if (i.commandName === '상태') {
-    const embed = new EmbedBuilder()
-      .setTitle('📊 상태')
-      .addFields(
-        { name: 'KMA (기상청)', value: `${stats.kma.status} (${stats.kma.attempts})`, inline: true },
-        { name: 'JMA (일본)', value: `${stats.jma.status} (${stats.jma.attempts})`, inline: true },
-        { name: 'NDMS (재난문자)', value: `${stats.ndms.status} (${stats.ndms.attempts})`, inline: true }
-      );
-    await i.reply({ embeds: [embed] });
-  }
-
-  if (i.commandName === '청소') {
-    sent.kma.clear();
-    sent.jma.clear();
-    sent.ndms.clear();
-    await Promise.all([
-      saveStateSafe('kma'),
-      saveStateSafe('jma'),
-      saveStateSafe('ndms')
-    ]);
-    await i.reply('초기화 완료');
-  }
+// 간단한 상태 모니터링 웹 서버
+express().get('/', (_, res) => res.json(stats)).listen(CONFIG.PORT, () => {
+  console.log(`[SYSTEM] Web health-check running on port ${CONFIG.PORT}`);
 });
-
-/* =========================
-   8. 종료
-========================= */
-async function shutdown() {
-  await Promise.all([
-    saveStateSafe('kma'),
-    saveStateSafe('jma'),
-    saveStateSafe('ndms')
-  ]);
-  client.destroy();
-  server.close(() => process.exit(0));
-}
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-
-// 로그인
-async function startBot() {
-  try {
-    await client.login(DISCORD_TOKEN);
-    console.log('[LOGIN SUCCESS]');
-  } catch (err) {
-    console.error('[LOGIN ERROR FULL]', err);
-  }
-}
-
-startBot();
