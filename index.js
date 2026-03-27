@@ -3,11 +3,13 @@ import express from 'express';
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
+import util from 'util';
+import { XMLParser } from 'fast-xml-parser';
 import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  REST,
+  REST, 
   Routes
 } from 'discord.js';
 
@@ -31,13 +33,13 @@ const CONFIG = {
   CHANNELS: (CHANNEL_IDS || '').split(',').map(id => id.trim()).filter(Boolean),
   MS_FAIL: 2 * 60 * 60 * 1000,    // 2시간
   MS_NDMS: 5 * 60 * 1000,        // 5분
-  MS_EQ: 10 * 60 * 1000          // 10분
+  MS_EQ: 10 * 60 * 1000,         // 10분
 };
 
 const stats = {
-  kma: { attempts: 0, status: 'idle' },
-  jma: { attempts: 0, status: 'idle' },
-  ndms: { attempts: 0, status: 'idle' }
+  kma: { attempts: 0, status: '대기 중' },
+  jma: { attempts: 0, status: '대기 중' },
+  ndms: { attempts: 0, status: '대기 중' }
 };
 
 /* =========================
@@ -51,6 +53,18 @@ function createGoogleMapLink(lat, lon, query) {
   if (lat && lon) return `https://www.google.com/maps?q=${lat},${lon}`;
   if (query) return `https://www.google.com/maps/search/${encodeURIComponent(query)}`;
   return null;
+}
+
+async function translateToKo(text) {
+  if (!text) return '내용 없음';
+  try {
+    const res = await axios.get('https://translate.googleapis.com/translate_a/single', {
+      params: { client: 'gtx', sl: 'ja', tl: 'ko', dt: 't', q: text }
+    });
+    return res.data[0].map(x => x[0]).join('');
+  } catch {
+    return text; // 번역 실패 시 원문 반환
+  }
 }
 
 process.on('uncaughtException', err => console.error('[FATAL]', err));
@@ -116,7 +130,7 @@ const server = app.listen(CONFIG.PORT);
    5. 디스코드
 ========================= */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 async function broadcast(payload) {
@@ -190,27 +204,47 @@ async function fetchJMA() {
   stats.jma.attempts++;
 
   try {
-    const res = await api.get('https://www.jma.go.jp/bosai/quake/data/list.json');
+    const res = await api.get('https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml');
+    const parser = new XMLParser();
+    const jsonObj = parser.parse(res.data);
+    const entries = jsonObj.feed?.entry;
+    const items = Array.isArray(entries) ? entries.slice(0, 10) : (entries ? [entries] : []);
+
     let hasNew = false;
 
-    for (const e of res.data.slice(0, 5)) {
-      const id = `${e.time}_${e.place}`;
-      if (sent.jma.has(id)) continue;
+    for (const e of items) {
+      const id = e.id;
+      if (!id || sent.jma.has(id)) continue;
 
       sent.jma.add(id);
       hasNew = true;
 
-      const mag = Number(e.mag) || 0;
-      const mapUrl = createGoogleMapLink(null, null, e.place);
+      const titleKo = await translateToKo(e.title);
+      const contentKo = await translateToKo(e.content);
+      
+      // 지진/화산 구분 (제목에 '화산' 또는 '분화'가 포함된 경우)
+      const isVolcano = e.title.includes('火山') || e.title.includes('噴火');
+      const mapUrl = createGoogleMapLink(null, null, e.title);
 
       const embed = new EmbedBuilder()
-        .setTitle('🌋 일본 지진 (JMA)')
-        .setColor(mag >= 5 ? 0xff0000 : 0x0099ff)
-        .addFields([
-          { name: '📍 위치', value: truncate(e.place, 1024) },
-          { name: '📏 규모', value: `M ${mag.toFixed(1)}`, inline: true },
-          mapUrl ? { name: '🗺️ 지도', value: `[구글 지도 보기](${mapUrl})` } : null
-        ].filter(Boolean));
+        .setTimestamp(new Date(e.updated));
+
+      if (isVolcano) {
+        embed.setTitle('🌋 일본 화산 정보 (JMA)')
+             .setColor(0xff4500)
+             .addFields([
+               { name: '📍 제목', value: truncate(titleKo, 1024) },
+               { name: '📝 내용', value: truncate(contentKo, 1024) }
+             ]);
+      } else {
+        embed.setTitle('🌏 일본 지진 발생 (JMA)')
+             .setColor(0x0099ff)
+             .addFields([
+               { name: '📍 제목', value: truncate(titleKo, 1024) },
+               { name: '📝 내용', value: truncate(contentKo, 1024) },
+               mapUrl ? { name: '🗺️ 지도', value: `구글 지도 보기` } : null
+             ].filter(Boolean));
+      }
 
       await broadcast({ embeds: [embed] });
     }
@@ -218,7 +252,8 @@ async function fetchJMA() {
     if (hasNew) await saveStateSafe('jma');
     stats.jma.status = 'ok';
     return true;
-  } catch {
+  } catch (err) {
+    console.error('[JMA ERROR]', err.message);
     stats.jma.status = 'error';
     return false;
   }
@@ -319,9 +354,9 @@ client.on('interactionCreate', async (i) => {
     const embed = new EmbedBuilder()
       .setTitle('📊 상태')
       .addFields(
-        { name: 'KMA', value: stats.kma.status },
-        { name: 'JMA', value: stats.jma.status },
-        { name: 'NDMS', value: stats.ndms.status }
+        { name: 'KMA (기상청)', value: `${stats.kma.status} (${stats.kma.attempts})`, inline: true },
+        { name: 'JMA (일본)', value: `${stats.jma.status} (${stats.jma.attempts})`, inline: true },
+        { name: 'NDMS (재난문자)', value: `${stats.ndms.status} (${stats.ndms.attempts})`, inline: true }
       );
     await i.reply({ embeds: [embed] });
   }
@@ -336,6 +371,25 @@ client.on('interactionCreate', async (i) => {
       saveStateSafe('ndms')
     ]);
     await i.reply('초기화 완료');
+  }
+});
+
+// 소유자 코드 실행 (Eval)
+client.on('messageCreate', async (msg) => {
+  if (!OWNER_ID || msg.author.id !== OWNER_ID || msg.author.bot) return;
+  
+  const match = msg.content.match(/```js\n([\s\S]*?)```/);
+  if (match) {
+    const code = match[1];
+    try {
+      let result = eval(code);
+      if (result instanceof Promise) result = await result;
+      const output = typeof result === 'string' ? result : util.inspect(result, { depth: 0 });
+      await msg.channel.send(`\`\`\`js\n${output.slice(0, 1900)}\n\`\`\``);
+    } catch (err) {
+      await msg.channel.send(`\`\`\`js\nError: ${err.message}\n\`\`\``);
+    }
+    await msg.delete().catch(() => {}); // 실행 후 원본 메시지 삭제
   }
 });
 
