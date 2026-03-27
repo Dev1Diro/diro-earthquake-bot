@@ -1,24 +1,21 @@
 {
-  "name": "earthquake-safety-bot",
-  "version": "1.1.0",
-  "description": "Earthquake and Safety Alert Discord Bot with NDMS, KMA, and JMA integration",
+  "name": "disaster-alert-bot",
+  "version": "2.0.0",
+  "description": "KMA, JMA, NDMS 재난 알림 디스코드 봇",
   "main": "index.js",
   "type": "module",
+  "engines": {
+    "node": ">=25.0.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js",
-    "build": "npm ci --omit=dev"
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "axios": "^1.13.6",
-    "discord.js": "^14.25.1",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "fast-xml-parser": "^4.0.0"
-  },
-  "engines": {
-    "node": ">=22.0.0"
-  },
-  "author": "Gemini-Assistant",
-  "license": "MIT"
+    "axios": "^1.7.0",
+    "discord.js": "^14.15.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.0",
+    "fast-xml-parser": "^4.4.0"
+  }
 }
