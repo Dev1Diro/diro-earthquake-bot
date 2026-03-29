@@ -1,7 +1,7 @@
 {
   "name": "disaster-alert-bot",
-  "version": "3.1.0",
-  "description": "KMA, JMA, NDMS 통합 재난 알림 봇",
+  "version": "7.0.0",
+  "description": "KMA · JMA · NDMS · USGS 통합 재난 알림 봇 — World-Class Enterprise",
   "main": "index.js",
   "type": "module",
   "engines": {
