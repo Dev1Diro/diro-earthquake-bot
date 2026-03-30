@@ -1,7 +1,7 @@
 {
   "name": "disaster-alert-bot",
-  "version": "7.0.0",
-  "description": "KMA · JMA · NDMS · USGS 통합 재난 알림 봇 — World-Class Enterprise",
+  "version": "9.0.0",
+  "description": "KMA · JMA · NDMS · USGS 통합 재난 알림 봇 — World-Class Enterprise v9 (AI 여진 예측 포함)",
   "main": "index.js",
   "type": "module",
   "engines": {
@@ -15,6 +15,8 @@
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
     "express": "^5.1.0",
-    "fast-xml-parser": "^5.5.9"
+    "express-rate-limit": "^7.5.0",
+    "fast-xml-parser": "^5.5.9",
+    "helmet": "^8.0.0"
   }
 }
