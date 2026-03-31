@@ -1,22 +1,48 @@
 {
   "name": "disaster-alert-bot",
-  "version": "9.0.0",
-  "description": "KMA · JMA · NDMS · USGS 통합 재난 알림 봇 — World-Class Enterprise v9 (AI 여진 예측 포함)",
+  "version": "10.0.0",
+  "description": "국내외 지진·쓰나미·재난문자 통합 실시간 알림 봇 (AI 예측 탑재) - 엔터프라이즈급 안정성 및 성능 강화",
   "main": "index.js",
   "type": "module",
-  "engines": {
-    "node": ">=25.0.0"
-  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "NODE_ENV=development node index.js",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "disaster",
+    "earthquake",
+    "tsunami",
+    "kma",
+    "jma",
+    "usgs",
+    "ndms",
+    "ai",
+    "gemini",
+    "groq",
+    "cerebras",
+    "nodejs",
+    "enterprise"
+  ],
+  "author": "Your Name/Organization",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "axios": "^1.14.0",
-    "discord.js": "^14.25.1",
-    "dotenv": "^17.3.1",
-    "express": "^5.1.0",
+    "axios": "^1.7.9",
+    "discord.js": "^14.17.3",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
-    "fast-xml-parser": "^5.5.9",
+    "fast-xml-parser": "^4.5.1",
     "helmet": "^8.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2"
   }
 }
