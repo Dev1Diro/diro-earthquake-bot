@@ -1,48 +1,35 @@
 {
   "name": "disaster-alert-bot",
-  "version": "10.0.0",
-  "description": "국내외 지진·쓰나미·재난문자 통합 실시간 알림 봇 (AI 예측 탑재) - 엔터프라이즈급 안정성 및 성능 강화",
-  "main": "index.js",
+  "version": "12.0.0",
+  "description": "엔터프라이즈급 동아시아(한중일) 지진 & 재난 알림 + 안티 테러 및 도배 방지 봇",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "NODE_ENV=development node index.js",
-    "lint": "eslint .",
-    "format": "prettier --write ."
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
     "discord",
     "bot",
-    "disaster",
     "earthquake",
-    "tsunami",
-    "kma",
-    "jma",
-    "usgs",
-    "ndms",
-    "ai",
-    "gemini",
-    "groq",
-    "cerebras",
-    "nodejs",
-    "enterprise"
+    "disaster",
+    "antiraid",
+    "antispam",
+    "verification"
   ],
-  "author": "Your Name/Organization",
+  "author": "",
   "license": "MIT",
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "dependencies": {
     "axios": "^1.7.9",
-    "discord.js": "^14.17.3",
+    "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
     "fast-xml-parser": "^4.5.1",
     "helmet": "^8.0.0"
   },
-  "devDependencies": {
-    "eslint": "^9.17.0",
-    "prettier": "^3.4.2"
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
