@@ -1,17 +1,3 @@
-**
- * ╔════════════════════════════════════════════════════════════════╗
- * ║  재난 알림 봇 v12.1.0  —  초고속 에디션 (Ping < 20ms)           ║
- * ║  소스: NDMS · KMA · JMA (동아시아만, 한중일)                    ║
- * ║                                                                ║
- * ║  [v12.1 초고속 튜닝]                                            ║
- * ║  ├─ 캐시 전면 비활성화 (Zero-Cache): 메모리 및 수신 오버헤드 해제║
- * ║  ├─ TCP 연결 재사용 극대화 (Keep-Alive MaxSockets)             ║
- * ║  ├─ 비동기 연산 오버헤드 최소화 (메인 이벤트 루프 블로킹 방지)     ║
- * ║  ├─ 가벼운 정규식 대체, Set/Map 구조 기반 O(1) 초고속 조회     ║
- * ║  └─ 핑(Ping) 측정 명령어 최적화 (Gateway WebSocket Latency)     ║
- * ╚════════════════════════════════════════════════════════════════╝
- */
-
 import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
@@ -25,12 +11,8 @@ import { fileURLToPath } from 'url';
 import {
   Client, GatewayIntentBits, Partials, Options,
   EmbedBuilder, REST, Routes, Events,
-  ApplicationCommandOptionType, PermissionFlagsBits, AuditLogEvent
+  ApplicationCommandOptionType, AuditLogEvent
 } from 'discord.js';
-
-/* ══════════════════════════════════════════════════════════════
-   §0. 상수 & 설정 (최적화)
-════════════════════════════════════════════════════════════════ */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOG_LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3, CRITICAL: 4, FATAL: 5 };
@@ -57,19 +39,19 @@ const ENV = Object.freeze({
 
 const CFG = Object.freeze({
   MS: { NDMS: 2 * 60_000, KMA: 5 * 60_000, JMA: 30_000, ERR: 20 * 60_000 },
-  RETRY: { BASE: [1_000, 3_000], JITTER: 0.1 }, // 재시도 백오프 축소
+  RETRY: { BASE: [1_000, 3_000], JITTER: 0.1 },
   CB: { THRESH: 3, HALF_MS: 5 * 60_000, ERR_CD_MS: 10 * 60_000 },
-  CACHE: { TTL: 24 * 3_600_000, SENT_MAX: 1_200, MSG_BUFFER: 0 }, // 캐시 버퍼 완전 제거
+  CACHE: { TTL: 24 * 3_600_000, SENT_MAX: 1_200, MSG_BUFFER: 0 },
   DEDUP: { DIST_KM: 80, MAG_D: 0.5, TIME_MS: 5 * 60_000, MAX: 200 },
   REGIONS: {
     KR: { name: '한국', lat: [33.0, 38.9], lon: [124.5, 132.0] },
     CN: { name: '중국', lat: [18.0, 53.0], lon: [73.0, 135.0] },
     JP: { name: '일본', lat: [30.0, 45.0], lon: [130.0, 145.0] },
   },
-  BROADCAST_GAP: 50, // 브로드캐스트 대기시간 단축
+  BROADCAST_GAP: 50,
   SHUTDOWN_MS: 8_000,
-  API_TIMEOUT: 4_000, // 원격 요청 타임아웃 단축
-  MAX_CONCURRENT: 20, // 동시 처리 연결 증대
+  API_TIMEOUT: 4_000,
+  MAX_CONCURRENT: 20,
   VERIFY: {
     DAYS: 50,
     COUNTER_SAVE_MS: 15_000,
@@ -81,10 +63,6 @@ const CFG = Object.freeze({
     BAN_THRESHOLD: 10,
   }
 });
-
-/* ══════════════════════════════════════════════════════════════
-   §1. 비동기식 고성능 배치 로거
-════════════════════════════════════════════════════════════════ */
 
 class Logger {
   constructor(source) {
@@ -126,10 +104,6 @@ class Logger {
 const mainLogger = new Logger('MAIN');
 const securityLogger = new Logger('SECURE');
 
-/* ══════════════════════════════════════════════════════════════
-   §2. 메트릭
-════════════════════════════════════════════════════════════════ */
-
 class Metrics {
   constructor() {
     this.eq = 0;
@@ -169,17 +143,9 @@ class Metrics {
 
 const metrics = new Metrics();
 
-/* ══════════════════════════════════════════════════════════════
-   §3. 보안 & 입력 검증
-════════════════════════════════════════════════════════════════ */
-
 const DANGER_RE = /[<>"'`\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 const sane = (v, max = 1024) => 
   v == null ? '없음' : String(v).replace(DANGER_RE, '').slice(0, max) || '없음';
-
-/* ══════════════════════════════════════════════════════════════
-   §4. 지진 데이터 클래스
-════════════════════════════════════════════════════════════════ */
 
 class Earthquake {
   constructor(data) {
@@ -213,10 +179,6 @@ class Earthquake {
   }
 }
 
-/* ══════════════════════════════════════════════════════════════
-   §5. Haversine & 고속 중복 제거
-════════════════════════════════════════════════════════════════ */
-
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371, d2r = Math.PI / 180;
   const a = Math.sin((lat2 - lat1) * d2r / 2) ** 2 + 
@@ -237,7 +199,6 @@ function isDuplicate({ src, lat, lon, mag, time }) {
     return false;
   }
 
-  // 선형 스캔 범위를 15개로 더 줄여 고속화
   const scanLimit = Math.min(15, GEV.length);
   for (let i = 0; i < scanLimit; i++) {
     const ev = GEV[i];
@@ -255,16 +216,11 @@ function isDuplicate({ src, lat, lon, mag, time }) {
 
 function getRegion(lat, lon) {
   if (!lat || !lon) return null;
-  // 하드코딩된 논리 비교로 초고속 평가
   if (lat >= 33.0 && lat <= 38.9 && lon >= 124.5 && lon <= 132.0) return 'KR';
   if (lat >= 30.0 && lat <= 45.0 && lon >= 130.0 && lon <= 145.0) return 'JP';
   if (lat >= 18.0 && lat <= 53.0 && lon >= 73.0 && lon <= 135.0) return 'CN';
   return null;
 }
-
-/* ══════════════════════════════════════════════════════════════
-   §6. Circuit Breaker
-════════════════════════════════════════════════════════════════ */
 
 class CircuitBreaker {
   constructor(name) {
@@ -313,10 +269,6 @@ class CircuitBreaker {
 const CB = { kma: new CircuitBreaker('KMA'), jma: new CircuitBreaker('JMA'), ndms: new CircuitBreaker('NDMS') };
 const TRK = { kma: { streak: 0, lastOk: null }, jma: { streak: 0, lastOk: null }, ndms: { streak: 0, lastOk: null } };
 
-/* ══════════════════════════════════════════════════════════════
-   §7. 고속 데이터 영구 저장소
-════════════════════════════════════════════════════════════════ */
-
 const SENT = { kma: new Map(), jma: new Map(), ndms: new Map() };
 const GUILD_CFG = new Map();
 const MEMBERS = new Map();
@@ -329,7 +281,6 @@ async function initStorage() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
     
-    // 비동기 병렬 대량 파일 입출력 로드
     const loadTasks = [
       ...Object.entries(SENT).map(async ([src, map]) => {
         try {
@@ -430,11 +381,6 @@ function getLogChannel(guildId) {
   return GUILD_CFG.get(guildId)?.logChannel || null;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   §8. 초고속 HTTP 커넥션 풀링 및 에이전트 튜닝
-════════════════════════════════════════════════════════════════ */
-
-// TCP Connection handshake 지연 방지를 위해 keepAlive 최대 유지 설정
 const httpAgent = new http.Agent({ 
   keepAlive: true, 
   maxSockets: 40, 
@@ -455,10 +401,6 @@ const HTTP = axios.create({
   httpAgent,
   httpsAgent,
 });
-
-/* ══════════════════════════════════════════════════════════════
-   §9. 유틸리티
-════════════════════════════════════════════════════════════════ */
 
 const jitter = ms => Math.floor(ms * (1 + (Math.random() * 2 - 1) * CFG.RETRY.JITTER));
 
@@ -490,10 +432,6 @@ async function withRetry(fn, src) {
   throw last;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   §10. 디스코드 게이트웨이 초초경량 캐시 최적화 (Zero-Cache 전술)
-════════════════════════════════════════════════════════════════ */
-
 const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -503,14 +441,13 @@ const discord = new Client({
     GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Message, Partials.Channel, Partials.GuildMember],
-  // 핑 지연의 핵심 범인인 캐시 수집 장치를 완전히 비활성화 (0 또는 최소화)
   makeCache: Options.cacheWithLimits({
     ApplicationCommandManager: 0,
     BaseGuildEmojiManager: 0,
     GuildEmojiManager: 0,
     GuildIdenpotencyManager: 0,
-    GuildMemberManager: 50, // 안티레이드 검사용 최소 멤버만 유지
-    GuildMessageManager: 0, // 이전 대화기록 수집 캐시 0으로 완전 무력화
+    GuildMemberManager: 50,
+    GuildMessageManager: 0,
     GuildBanManager: 0,
     GuildInviteManager: 0,
     GuildScheduledEventManager: 0,
@@ -526,10 +463,6 @@ const discord = new Client({
     VoiceStateManager: 0
   }),
 });
-
-/* ══════════════════════════════════════════════════════════════
-   §11. 병렬 브로드캐스트 엔진
-════════════════════════════════════════════════════════════════ */
 
 const Q = [];
 let broadcasting = false;
@@ -572,10 +505,6 @@ async function processQueue() {
 
   broadcasting = false;
 }
-
-/* ══════════════════════════════════════════════════════════════
-   §12. 임베드 빌더
-════════════════════════════════════════════════════════════════ */
 
 function buildEqEmbed(eq) {
   const { color, em, label } = magStyle(eq.mag ?? 0);
@@ -621,10 +550,6 @@ function buildDisasterEmbed({ title, desc, loc, time }) {
     .setThumbnail('https://cdn-icons-png.flaticon.com/512/1995/1995467.png')
     .setTimestamp(time);
 }
-
-/* ══════════════════════════════════════════════════════════════
-   §13. 데이터 수집
-════════════════════════════════════════════════════════════════ */
 
 const ERR_COOLDOWN = { kma: { msg: '', at: 0 }, jma: { msg: '', at: 0 }, ndms: { msg: '', at: 0 } };
 
@@ -831,15 +756,8 @@ async function fetchJMA() {
   }
 }
 
-/* ══════════════════════════════════════════════════════════════
-   §14. 극대화 튜닝된 안티 스팸 및 테러 방지 필터
-════════════════════════════════════════════════════════════════ */
-
 const msgTimestamps = new Map();
 
-/**
- * 전역 메모리 내 O(1) 필터링 (불필요한 비동기식 I/O 호출 일절 차단)
- */
 async function handleSpamFilter(message) {
   if (message.author.bot || !message.guild) return;
   const { author, member, guild } = message;
@@ -854,7 +772,6 @@ async function handleSpamFilter(message) {
   }
   times.push(now);
 
-  // slice/filter 연산 간소화
   const cutoff = now - CFG.ANTISPAM.WINDOW_MS;
   let validCount = 0;
   for (let i = times.length - 1; i >= 0; i--) {
@@ -862,7 +779,6 @@ async function handleSpamFilter(message) {
     else break;
   }
 
-  // 3초 내 메시지 개수가 허용 배열의 크기를 넘어서면 이전 기록 청소
   if (times.length > 30) {
     msgTimestamps.set(author.id, times.slice(-20));
   }
@@ -872,7 +788,7 @@ async function handleSpamFilter(message) {
 
     const currentWarnings = (SPAM_STREAKS.get(author.id) || 0) + 1;
     SPAM_STREAKS.set(author.id, currentWarnings);
-    persistMembers(); // Non-blocking 백그라운드 저장
+    persistMembers();
 
     const isBanTrigger = currentWarnings >= CFG.ANTISPAM.BAN_THRESHOLD;
     const embed = new EmbedBuilder()
@@ -913,12 +829,8 @@ async function handleSpamFilter(message) {
   }
 }
 
-/**
- * 실시간 감사 로그 쿼리 - 비동기 대기시간 최소화로 처리 핑 유지
- */
 async function punishRaidUser(guild, actionType, targetName) {
   try {
-    // Audit Log 지연 반영 대비 타임아웃 조정 (대기 시간을 300ms로 대폭 단축하여 반응 핑 20ms대 유지)
     await new Promise(resolve => setTimeout(resolve, 300));
     const fetchedLogs = await guild.fetchAuditLogs({
       limit: 1,
@@ -933,7 +845,6 @@ async function punishRaidUser(guild, actionType, targetName) {
       return null;
     }
 
-    // 테러 공격 유저 즉시 격리
     await guild.members.ban(executor.id, { reason: `[안티 레이드] 승인되지 않은 구조 변조 시도 (${targetName})` });
     securityLogger.critical(`안티 레이드 경보 - 폭파범 즉각 차단 성공: ${executor.tag}`);
 
@@ -955,10 +866,6 @@ async function punishRaidUser(guild, actionType, targetName) {
   }
 }
 
-/* ══════════════════════════════════════════════════════════════
-   §15. 테러 즉각 대응 및 자동 원격 원상복구 루틴
-════════════════════════════════════════════════════════════════ */
-
 discord.on(Events.ChannelDelete, async channel => {
   if (!channel.guild) return;
   const executor = await punishRaidUser(channel.guild, AuditLogEvent.ChannelDelete, `채널 삭제: #${channel.name}`);
@@ -974,7 +881,6 @@ discord.on(Events.ChannelDelete, async channel => {
       deny: o.deny.toArray()
     }));
 
-    // 삭제된 원본 채널과 완전히 똑같은 사양으로 미러링 복원
     const restoredChannel = await channel.guild.channels.create({
       name: channel.name,
       type: type,
@@ -1047,10 +953,6 @@ discord.on(Events.GuildBanAdd, async ban => {
   await punishRaidUser(ban.guild, AuditLogEvent.MemberBanAdd, `멤버 무단 밴: ${ban.user.tag}`);
 });
 
-/* ══════════════════════════════════════════════════════════════
-   §16. 슬래시 커맨드 (초고속 응답 최적화)
-════════════════════════════════════════════════════════════════ */
-
 const CMDS = [
   { name: '상태', description: '실시간 게이트웨이 레이턴시 및 봇 가동 상태 확인' },
   { name: '통계', description: '처리 통계' },
@@ -1073,7 +975,7 @@ discord.on(Events.InteractionCreate, async ix => {
   try {
     if (cmd === '상태') {
       const up = process.uptime();
-      const wsPing = discord.ws.ping; // 디스코드 게이트웨이 실시간 수신 핑
+      const wsPing = discord.ws.ping;
       const pingStatus = wsPing < 20 ? `🟢 ${wsPing}ms (초고속 성능 유지)` : `🟡 ${wsPing}ms`;
 
       return ix.reply({
@@ -1278,14 +1180,10 @@ discord.on(Events.MessageCreate, async message => {
   await handleSpamFilter(message);
 });
 
-/* ══════════════════════════════════════════════════════════════
-   §17. 경량 Express 포트 리스너
-════════════════════════════════════════════════════════════════ */
-
 const app = express();
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
 app.use(rateLimit({ windowMs: 15 * 60_000, max: 100 }));
-app.use(express.json({ limit: '5kb' })); // JSON 분석 버퍼 한도 최소화
+app.use(express.json({ limit: '5kb' }));
 
 app.get('/health', (_, res) => {
   const healthy = !Object.values(CB).some(c => c.state === 'OPEN');
@@ -1300,10 +1198,6 @@ app.get('/metrics', (_, res) => res.json(metrics.getStats()));
 app.use((_, res) => res.status(404).json({ error: 'Not Found' }));
 
 const server = app.listen(ENV.PORT, () => mainLogger.info(`포트 ${ENV.PORT} 개방 완료`));
-
-/* ══════════════════════════════════════════════════════════════
-   §18. 초고속 비차단 정기 수집 루프
-════════════════════════════════════════════════════════════════ */
 
 discord.once(Events.ClientReady, async () => {
   mainLogger.info(`로그인 처리 완료: ${discord.user.tag}`);
@@ -1333,10 +1227,6 @@ discord.once(Events.ClientReady, async () => {
     rest.put(Routes.applicationCommands(ENV.APPLICATION_ID), { body: CMDS }).catch(() => {});
   }
 });
-
-/* ══════════════════════════════════════════════════════════════
-   §19. Graceful Shutdown
-════════════════════════════════════════════════════════════════ */
 
 async function shutdown() {
   mainLogger.critical('종료 신호 감지, 메모리 전송기 종료');
