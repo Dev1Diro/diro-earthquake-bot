@@ -2,26 +2,27 @@ import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
-import https from 'https';
-import http from 'http';
+import dns from 'dns';
 import { fileURLToPath } from 'url';
 import {
   Client, GatewayIntentBits, Partials, Options,
-  EmbedBuilder, REST, Routes, Events,
+  EmbedBuilder, REST, Routes, Events, PermissionsBitField,
   ApplicationCommandOptionType
 } from 'discord.js';
 
+process.on('warning', (warning) => {
+  if (!warning.message.includes('MaxListenersExceeded')) console.warn('WARNING:', warning.message);
+});
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const LOG_LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3, CRITICAL: 4, FATAL: 5 };
-let LOG_LEVEL = process.env.NODE_ENV === 'development' ? LOG_LEVELS.DEBUG : LOG_LEVELS.INFO;
+dns.setDefaultResultOrder('ipv4first');
 
 const requiredEnv = ['DISCORD_TOKEN', 'KMA_KEY', 'SAFETY_KEY'];
 for (const env of requiredEnv) {
   if (!process.env[env]) {
-    console.error(`❌ ${env} 필수`);
+    console.error(`❌ ${env} 필수 환경변수가 누락되었습니다.`);
     process.exit(1);
   }
 }
@@ -31,863 +32,453 @@ const ENV = Object.freeze({
   KMA_KEY: process.env.KMA_KEY,
   SAFETY_KEY: process.env.SAFETY_KEY,
   APPLICATION_ID: process.env.APPLICATION_ID || '',
-  OWNER_ID: process.env.OWNER_ID || '',
   PORT: Number(process.env.PORT) || 3000,
-  CHANNEL_IDS: (process.env.CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean),
+  CHANNEL_IDS: Object.freeze((process.env.CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean)),
 });
 
 const CFG = Object.freeze({
-  MS: { SAFE: 2 * 60_000, KMA: 5 * 60_000, JMA: 30_000, ERR: 20 * 60_000 },
-  RETRY: { BASE: [800, 2_000], JITTER: 0.1 },
-  CB: { THRESH: 3, HALF_MS: 5 * 60_000, ERR_CD_MS: 10 * 60_000 },
-  CACHE: { TTL: 24 * 3_600_000, SENT_MAX: 1_500, MSG_BUFFER: 0 },
-  DEDUP: { DIST_KM: 80, MAG_D: 0.5, TIME_MS: 5 * 60_000, MAX: 200 },
-  REGIONS: {
-    KR: { name: '한국', lat: [33.0, 38.9], lon: [124.5, 132.0] },
-    CN: { name: '중국', lat: [18.0, 53.0], lon: [73.0, 135.0] },
-    JP: { name: '일본', lat: [30.0, 45.0], lon: [130.0, 145.0] },
-  },
-  BROADCAST_GAP: 50,
-  SHUTDOWN_MS: 8_000,
-  API_TIMEOUT: 4_000,
-  MAX_CONCURRENT: 25,
-  EMERGENCY: {
-    SAFE: { color: 0xFFDD00, mention: false, repeats: 1 },
-    URGENT: { color: 0xFF8800, mention: true, repeats: 1 },
-    CRITICAL: { color: 0xFF0000, mention: true, repeats: 5 },
-  }
+  MS: { SAFE: 120_000, KMA: 150_000, JMA: 60_000 },
+  RETRY: [200, 400],
+  CB_THRESH: 3,
+  CACHE_TTL: 86_400_000,
+  DEDUP_KM: 80,
+  DEDUP_MAG: 0.5,
+  DEDUP_MS: 300_000,
+  API_TIMEOUT: 2500,
+  BROADCAST_CHUNK: 45, 
+  BROADCAST_DELAY: 1050,
 });
 
-class Logger {
-  constructor(source) {
-    this.source = String(source).padEnd(6);
-    this.buffer = [];
-    this.flushTimer = setInterval(() => this.flush(), 3000);
-    this.flushTimer.unref();
+class FastLog {
+  constructor(src) {
+    this.src = src;
+    this.buf = [];
+    setInterval(() => this.flush(), 5000);
   }
-
-  log(level, msg, extra = '') {
-    if (LOG_LEVELS[level] < LOG_LEVEL) return;
-    const ts = new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
-    const ex = extra ? ` | ${String(extra).slice(0, 80)}` : '';
-    this.buffer.push(`${ts} [${level.padEnd(8)}][${this.source}] ${msg}${ex}`);
-    if (this.buffer.length >= 100 || level === 'FATAL') this.flush();
+  log(msg) {
+    this.buf.push(`${new Date().toISOString()} [${this.src}] ${msg}`);
+    if (this.buf.length >= 20) this.flush();
   }
-
-  flush() {
-    if (this.buffer.length === 0) return;
-    console.log(this.buffer.join('\n'));
-    this.buffer = [];
-  }
-
-  destroy() {
-    clearInterval(this.flushTimer);
+  error(msg, err) {
+    this.buf.push(`${new Date().toISOString()} [${this.src} ERR] ${msg} - ${err?.message || err}`);
     this.flush();
   }
-
-  debug(msg, ex) { this.log('DEBUG', msg, ex); }
-  info(msg, ex) { this.log('INFO', msg, ex); }
-  warn(msg, ex) { this.log('WARN', msg, ex); }
-  error(msg, ex) { this.log('ERROR', msg, ex); }
-  critical(msg, ex) { this.log('CRITICAL', msg, ex); }
-  fatal(msg, ex) { this.log('FATAL', msg, ex); process.exit(1); }
-}
-
-const mainLogger = new Logger('MAIN');
-
-class Metrics {
-  constructor() {
-    this.eq = 0;
-    this.apiCalls = new Map();
-    this.errors = new Map();
-    this.startTime = Date.now();
-  }
-
-  addEq() { this.eq++; }
-  
-  recordApiCall(src, ms) {
-    const stat = this.apiCalls.get(src) || { n: 0, t: 0 };
-    stat.n++;
-    stat.t += ms;
-    if (stat.n > 500) { stat.n = 250; stat.t = Math.round(stat.t / 2); }
-    this.apiCalls.set(src, stat);
-  }
-
-  recordErr(src) {
-    this.errors.set(src, (this.errors.get(src) ?? 0) + 1);
-  }
-
-  getStats() {
-    const mem = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
-    const avgTime = {};
-    for (const [s, { n, t }] of this.apiCalls) avgTime[s] = n ? Math.round(t / n) : 0;
-    
-    return {
-      uptime: Math.floor((Date.now() - this.startTime) / 1000),
-      messages: this.eq,
-      memory: mem,
-      avgResponseTime: avgTime,
-      errors: Object.fromEntries(this.errors),
-    };
+  flush() {
+    if (this.buf.length) {
+      console.log(this.buf.join('\n'));
+      this.buf.length = 0;
+    }
   }
 }
+const logger = new FastLog('BOT');
 
-const metrics = new Metrics();
+const sanitize = (v, max = 150) => typeof v === 'string' ? v.replace(/[<>"'`\x00-\x1f]/g, '').slice(0, max) : '';
 
-const DANGER_RE = /[<>"'`\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
-const sane = (v, max = 1024) => 
-  v == null ? '' : String(v).replace(DANGER_RE, '').slice(0, max) || '';
-
-class Earthquake {
-  constructor(data) {
-    this.id = String(data.id || '').slice(0, 100);
-    this.source = data.source;
-    this.location = String(data.location || '미상').slice(0, 200);
-    this.lat = typeof data.latitude === 'number' ? data.latitude : null;
-    this.lon = typeof data.longitude === 'number' ? data.longitude : null;
-    this.mag = typeof data.magnitude === 'number' ? data.magnitude : null;
-    this.depth = typeof data.depth === 'number' ? data.depth : null;
-    this.intensity = data.intensity ? String(data.intensity).slice(0, 50) : null;
-    this.time = typeof data.timestamp === 'number' ? data.timestamp : Date.now();
-  }
-
-  get aftershockProb() {
-    if (!this.mag || this.mag < 4) return null;
-    if (this.mag < 5) return '5~20%';
-    if (this.mag < 6) return '20~40%';
-    if (this.mag < 7) return '40~65%';
-    return '65~80%';
-  }
+const DEG2RAD = Math.PI / 180;
+function calcDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const a = Math.sin((lat2 - lat1) * DEG2RAD / 2) ** 2 + 
+            Math.cos(lat1 * DEG2RAD) * Math.cos(lat2 * DEG2RAD) * Math.sin((lon2 - lon1) * DEG2RAD / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(a)); 
 }
 
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371, d2r = Math.PI / 180;
-  const a = Math.sin((lat2 - lat1) * d2r / 2) ** 2 + 
-            Math.cos(lat1 * d2r) * Math.cos(lat2 * d2r) * Math.sin((lon2 - lon1) * d2r / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+function estimateIntensity(mag) {
+  if (!mag || mag < 2.0) return 'Ⅰ (무감)';
+  if (mag < 3.0) return 'Ⅰ~Ⅱ (조용한 상태에서 소수만 느낌)';
+  if (mag < 4.0) return 'Ⅱ~Ⅲ (실내의 일부 사람만 느낌)';
+  if (mag < 5.0) return 'Ⅳ~Ⅴ (창문이 흔들리고 잠에서 깸)';
+  if (mag < 6.0) return 'Ⅴ~Ⅶ (무거운 가구가 움직이고 벽에 금이 감)';
+  return 'Ⅶ 이상 (건물 손상 및 파괴 발생 가능)';
 }
 
-const GEV = [];
+function parseKMATime(str) {
+  if (!str || str.length !== 14) return Date.now();
+  const y = str.slice(0,4), m = str.slice(4,6), d = str.slice(6,8);
+  const h = str.slice(8,10), min = str.slice(10,12), s = str.slice(12,14);
+  return new Date(`${y}-${m}-${d}T${h}:${min}:${s}+09:00`).getTime();
+}
 
-function isDuplicate({ src, lat, lon, mag, time }) {
-  const now = Date.now(), cutoff = now - CFG.CACHE.TTL;
-  
-  while (GEV.length > 0 && GEV[GEV.length - 1].at < cutoff) GEV.pop();
-  if (GEV.length >= CFG.DEDUP.MAX) GEV.pop();
+let recentEvents = [];
+setInterval(() => {
+  const cutoff = Date.now() - CFG.CACHE_TTL;
+  recentEvents = recentEvents.filter(e => e.at >= cutoff);
+}, 60000);
 
-  if (!lat || !lon) {
-    GEV.unshift({ src, lat, lon, mag, time, at: now });
-    return false;
-  }
-
-  const scanLimit = Math.min(15, GEV.length);
-  for (let i = 0; i < scanLimit; i++) {
-    const ev = GEV[i];
-    if (!ev.lat || !ev.lon) continue;
-    if (Math.abs(mag - ev.mag) <= CFG.DEDUP.MAG_D &&
-        Math.abs(time - ev.time) <= CFG.DEDUP.TIME_MS &&
-        haversineKm(lat, lon, ev.lat, ev.lon) <= CFG.DEDUP.DIST_KM) {
+function isDuplicate({ lat, lon, mag, t }) {
+  const now = Date.now();
+  for (let i = 0, len = Math.min(5, recentEvents.length); i < len; i++) {
+    const e = recentEvents[i];
+    if (e.lat && e.lon && Math.abs((mag || 0) - e.mag) <= CFG.DEDUP_MAG && 
+        Math.abs((t || 0) - e.t) <= CFG.DEDUP_MS && 
+        calcDistance(lat, lon, e.lat, e.lon) <= CFG.DEDUP_KM) {
       return true;
     }
   }
-
-  GEV.unshift({ src, lat, lon, mag, time, at: now });
+  recentEvents.unshift({ lat, lon, mag, t, at: now });
   return false;
 }
 
-function getRegion(lat, lon) {
-  if (!lat || !lon) return null;
-  if (lat >= 33.0 && lat <= 38.9 && lon >= 124.5 && lon <= 132.0) return 'KR';
-  if (lat >= 30.0 && lat <= 45.0 && lon >= 130.0 && lon <= 145.0) return 'JP';
-  if (lat >= 18.0 && lat <= 53.0 && lon >= 73.0 && lon <= 135.0) return 'CN';
-  return null;
+class HealthStatus {
+  constructor() { this.fails = 0; }
+  ok() { this.fails = 0; }
+  fail() { this.fails++; }
+  isDegraded() { return this.fails >= CFG.CB_THRESH; }
 }
+const statusSafe = new HealthStatus();
+const statusKma = new HealthStatus();
+const statusJma = new HealthStatus();
 
-class CircuitBreaker {
-  constructor(name) {
-    this.name = name;
-    this.state = 'CLOSED';
-    this.failures = 0;
-    this.openedAt = 0;
-  }
-
-  async exec(fn) {
-    if (this.state === 'OPEN') {
-      const wait = CFG.CB.HALF_MS - (Date.now() - this.openedAt);
-      if (wait > 0) throw { cbOpen: true };
-      this.state = 'HALF_OPEN';
-    }
-
-    try {
-      const r = await fn();
-      if (this.failures > 0) this.state = 'CLOSED';
-      this.failures = 0;
-      return r;
-    } catch (e) {
-      if (!e.cbOpen) {
-        this.failures++;
-        if (this.failures >= CFG.CB.THRESH) {
-          this.state = 'OPEN';
-          this.openedAt = Date.now();
-        }
-      }
-      throw e;
-    }
-  }
-
-  forceClose() {
-    this.state = 'CLOSED';
-    this.failures = 0;
-  }
-
-  badge() {
-    if (this.state === 'CLOSED') return '✅';
-    if (this.state === 'HALF_OPEN') return '🟡';
-    return `❌ ${Math.ceil((CFG.CB.HALF_MS - (Date.now() - this.openedAt)) / 1000)}s`;
-  }
-}
-
-const CB = { kma: new CircuitBreaker('KMA'), jma: new CircuitBreaker('JMA'), safe: new CircuitBreaker('SAFE') };
-const TRK = { kma: { streak: 0, lastOk: null }, jma: { streak: 0, lastOk: null }, safe: { streak: 0, lastOk: null } };
-
-const SENT = { kma: new Map(), jma: new Map(), safe: new Map() };
-const GUILD_CFG = new Map();
-const TEMP_MESSAGES = new Map();
+const SENT_CACHE = new Map();
+const GUILD_MAP = new Map();
 const DATA_DIR = path.resolve(__dirname, 'data');
 
+async function safeSaveFile(filename, dataMap) {
+  const filePath = path.join(DATA_DIR, filename);
+  const tempPath = `${filePath}.tmp`;
+  try {
+    const obj = Object.create(null);
+    for (const [k, v] of dataMap.entries()) obj[k] = v;
+    await fs.writeFile(tempPath, JSON.stringify(obj), 'utf8');
+    await fs.rename(tempPath, filePath);
+  } catch (e) {
+    logger.error(`${filename} 저장 실패`, e);
+  }
+}
+
+let saveTimeout = null;
+function scheduleSave() {
+  if (saveTimeout) clearTimeout(saveTimeout);
+  saveTimeout = setTimeout(() => {
+    const now = Date.now();
+    for (const [id, timestamp] of SENT_CACHE.entries()) {
+      if (now - timestamp > CFG.CACHE_TTL) SENT_CACHE.delete(id);
+    }
+    safeSaveFile('sent.json', SENT_CACHE);
+    safeSaveFile('guild.json', GUILD_MAP);
+  }, 10000);
+}
+
 async function initStorage() {
-  const logger = new Logger('STORAGE');
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
-    
-    const loadTasks = [
-      ...Object.entries(SENT).map(async ([src, map]) => {
-        try {
-          const raw = await fs.readFile(path.join(DATA_DIR, `${src}.json`), 'utf8');
-          const data = JSON.parse(raw);
-          if (Array.isArray(data)) data.forEach(([id, ts]) => map.set(id, ts || Date.now()));
-        } catch {
-          await fs.writeFile(path.join(DATA_DIR, `${src}.json`), '[]', 'utf8').catch(() => {});
-        }
-      }),
-      (async () => {
-        try {
-          const raw = await fs.readFile(path.join(DATA_DIR, 'config.json'), 'utf8');
-          const cfgs = JSON.parse(raw);
-          Object.entries(cfgs).forEach(([id, cfg]) => GUILD_CFG.set(id, cfg));
-        } catch {
-          await fs.writeFile(path.join(DATA_DIR, 'config.json'), '{}', 'utf8').catch(() => {});
-        }
-      })()
-    ];
-
-    await Promise.all(loadTasks);
-    logger.info('저장소 준비 완료');
+    const loadFile = async (filename, mapObj) => {
+      try {
+        const raw = await fs.readFile(path.join(DATA_DIR, filename), 'utf8');
+        const parsed = JSON.parse(raw, (k, v) => k === '__proto__' ? undefined : v);
+        Object.entries(parsed).forEach(([k, v]) => mapObj.set(k, v));
+      } catch (e) {
+        if (e.code !== 'ENOENT') logger.error(`${filename} 로드 실패`, e);
+      }
+    };
+    await loadFile('sent.json', SENT_CACHE);
+    await loadFile('guild.json', GUILD_MAP);
   } catch (e) {
-    logger.error('저장소 초기화 실패');
+    logger.error('스토리지 초기화 실패', e);
   }
 }
 
-async function persistSent(src) {
-  try {
-    const tmp = path.join(DATA_DIR, `${src}.tmp`);
-    const final = path.join(DATA_DIR, `${src}.json`);
-    await fs.writeFile(tmp, JSON.stringify([...SENT[src].entries()]));
-    await fs.rename(tmp, final);
-  } catch {}
+function getTargetChannels() {
+  const channels = new Set(ENV.CHANNEL_IDS);
+  for (const channelId of GUILD_MAP.values()) channels.add(channelId);
+  return [...channels];
 }
 
-async function persistConfig() {
+async function fetchJSON(url, timeoutMs = CFG.API_TIMEOUT) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const tmp = path.join(DATA_DIR, 'config.tmp');
-    const final = path.join(DATA_DIR, 'config.json');
-    await fs.writeFile(tmp, JSON.stringify(Object.fromEntries(GUILD_CFG)));
-    await fs.rename(tmp, final);
-  } catch {}
-}
-
-async function sendLog(guildId, embed) {
-  try {
-    const logChannelId = getLogChannel(guildId);
-    if (!logChannelId) return;
-    const ch = await discord.channels.fetch(logChannelId);
-    if (ch?.isTextBased()) await ch.send({ embeds: [embed] });
-  } catch {}
-}
-
-function getAlertChannels() {
-  const ids = new Set(ENV.CHANNEL_IDS);
-  for (const cfg of GUILD_CFG.values()) {
-    if (cfg.alertChannel) ids.add(cfg.alertChannel);
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(id);
   }
-  return [...ids];
 }
 
-function getLogChannel(guildId) {
-  return GUILD_CFG.get(guildId)?.logChannel || null;
-}
-
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, freeSocketTimeout: 60000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, freeSocketTimeout: 60000, rejectUnauthorized: false });
-
-const HTTP = axios.create({
-  timeout: CFG.API_TIMEOUT,
-  headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-  httpAgent,
-  httpsAgent,
-});
-
-const jitter = ms => Math.floor(ms * (1 + (Math.random() * 2 - 1) * CFG.RETRY.JITTER));
-
-const gmap = (lat, lon) => lat && lon 
-  ? `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`
-  : 'https://www.google.com/maps';
-
-const magStyle = m => {
-  if (m >= 7) return { color: 0x660000, em: '🆘' };
-  if (m >= 6) return { color: 0xCC0000, em: '🔴' };
-  if (m >= 5) return { color: 0xFF6600, em: '🟠' };
-  if (m >= 4) return { color: 0xFFAA00, em: '🟡' };
-  return { color: 0x00AAFF, em: '🔵' };
-};
-
-async function withRetry(fn, src) {
-  let last;
-  for (let i = 0; i <= CFG.RETRY.BASE.length; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      last = e;
-      if (i < CFG.RETRY.BASE.length) {
-        await new Promise(r => setTimeout(r, jitter(CFG.RETRY.BASE[i])));
-      }
+const getJitter = ms => Math.floor(ms * (0.8 + Math.random() * 0.4));
+async function fetchWithRetry(fn) {
+  for (let i = 0; i <= CFG.RETRY.length; i++) {
+    try { return await fn(); } 
+    catch (e) {
+      if (i < CFG.RETRY.length) await new Promise(r => setTimeout(r, getJitter(CFG.RETRY[i])));
+      else throw e;
     }
   }
-  throw last;
 }
 
-const discord = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.MessageContent,
-  ],
-  partials: [Partials.Message, Partials.Channel, Partials.GuildMember],
-  makeCache: Options.cacheWithLimits({
-    ApplicationCommandManager: 0,
-    BaseGuildEmojiManager: 0,
-    GuildEmojiManager: 0,
-    GuildMemberManager: 50,
-    MessageManager: 0,
-    PresenceManager: 0,
-    ReactionManager: 0,
-    ThreadManager: 0,
-    VoiceStateManager: 0
-  }),
+const discordClient = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  partials: [Partials.Message, Partials.Channel],
+  makeCache: Options.cacheWithLimits({ MessageManager: 0, ThreadManager: 0 }),
 });
 
-const Q = [];
-let broadcasting = false;
+const broadcastQueue = [];
+let isBroadcasting = false;
 
-const broadcast = payload => new Promise((res, rej) => {
-  Q.push({ payload, res, rej });
-  processQueue();
-});
+async function broadcastMessage(payload) {
+  return new Promise((resolve, reject) => {
+    broadcastQueue.push({ payload, resolve, reject });
+    if (!isBroadcasting) processBroadcastQueue();
+  });
+}
 
-async function processQueue() {
-  if (broadcasting || Q.length === 0) return;
-  broadcasting = true;
-
-  while (Q.length > 0) {
-    const { payload, res, rej } = Q.shift();
+async function processBroadcastQueue() {
+  isBroadcasting = true;
+  while (broadcastQueue.length) {
+    const { payload, resolve, reject } = broadcastQueue.shift();
     try {
-      const channels = getAlertChannels();
-      
-      const promises = [];
-      for (let i = 0; i < channels.length; i += CFG.MAX_CONCURRENT) {
-        const chunk = channels.slice(i, i + CFG.MAX_CONCURRENT);
-        promises.push(
-          Promise.allSettled(
-            chunk.map(async id => {
-              try {
-                const ch = await discord.channels.fetch(id, { allowUnknownGuild: true });
-                if (ch?.isTextBased()) {
-                  const sent = await ch.send(payload);
-                  return sent;
-                }
-              } catch {}
-            })
-          )
-        );
-      }
-
-      const results = await Promise.all(promises);
-      
-      if (payload.tempDelete) {
-        const msgIds = [];
-        for (const result of results) {
-          for (const r of result) {
-            if (r.status === 'fulfilled' && r.value?.id) {
-              msgIds.push(r.value.id);
-            }
-          }
-        }
-        if (msgIds.length > 0) {
-          TEMP_MESSAGES.set(Math.random(), { ids: msgIds, channels: getAlertChannels(), at: Date.now() });
-        }
-      }
-
-      res();
-    } catch (e) {
-      rej(e);
-    }
-  }
-
-  broadcasting = false;
-}
-
-function buildEqEmbed(eq) {
-  const { color, em } = magStyle(eq.mag ?? 0);
-  const mapLink = eq.lat && eq.lon
-    ? `[${eq.lat.toFixed(2)}°, ${eq.lon.toFixed(2)}°](${gmap(eq.lat, eq.lon)})`
-    : '좌표 없음';
-
-  const fields = [
-    { name: `${em} 진원지`, value: `**${sane(eq.location, 150)}**`, inline: false }
-  ];
-  
-  if (eq.mag != null) fields.push({ name: '📏 규모', value: `**M ${eq.mag.toFixed(1)}**`, inline: true });
-  if (eq.depth != null) fields.push({ name: '🔽 깊이', value: `**${eq.depth.toFixed(0)} km**`, inline: true });
-  if (eq.intensity) fields.push({ name: '📊 진도', value: `**${sane(eq.intensity, 15)}**`, inline: true });
-  
-  fields.push({ name: '🕐 발생시간', value: `<t:${Math.floor(eq.time / 1000)}:F>`, inline: false });
-  
-  if (eq.aftershockProb) fields.push({ name: '⚡ 여진확률', value: eq.aftershockProb, inline: true });
-  
-  fields.push({ name: '🗺️ 좌표', value: mapLink, inline: false });
-
-  return new EmbedBuilder()
-    .setTitle(`${em} ${eq.source} 지진 감지`)
-    .setColor(color)
-    .addFields(fields)
-    .setFooter({ text: eq.source })
-    .setThumbnail('https://cdn-icons-png.flaticon.com/512/2909/2909985.png')
-    .setTimestamp(eq.time);
-}
-
-function buildSafeEmbed(title, desc, area, level) {
-  const config = CFG.EMERGENCY[level];
-  const icon = level === 'SAFE' ? '📢' : level === 'URGENT' ? '🚨' : '🆘';
-  
-  return new EmbedBuilder()
-    .setTitle(`${icon} ${sane(title, 150)}`)
-    .setColor(config.color)
-    .setDescription(sane(desc, 2000))
-    .addFields({ name: '📍 지역', value: `**${sane(area, 200)}**`, inline: true })
-    .setFooter({ text: `${level === 'SAFE' ? '안전안내' : level === 'URGENT' ? '긴급재난' : '위급재난'} | 행정안전부` })
-    .setTimestamp();
-}
-
-const ERR_COOLDOWN = { kma: { msg: '', at: 0 }, jma: { msg: '', at: 0 }, safe: { msg: '', at: 0 } };
-
-async function notifyErr(src, err) {
-  if (err?.cbOpen) return;
-  const msg = err?.message || 'Unknown';
-  const now = Date.now(), c = ERR_COOLDOWN[src];
-  if (c.msg === msg && now - c.at < CFG.CB.ERR_CD_MS) return;
-  c.msg = msg;
-  c.at = now;
-  metrics.recordErr(src);
-
-  const embed = new EmbedBuilder()
-    .setTitle(`⚠️ [${src}] 오류`)
-    .setColor(0xFF0000)
-    .setDescription(sane(msg, 512))
-    .setTimestamp();
-  
-  broadcast({ embeds: [embed] }).catch(() => {});
-}
-
-async function fetchSafe() {
-  if (!ENV.SAFETY_KEY) return;
-
-  try {
-    const start = Date.now();
-    const items = await CB.safe.exec(() =>
-      withRetry(async () => {
-        const { data } = await HTTP.get(
-          'https://www.safekorea.go.kr/safekorea-kor/ctim/cmsg/calamitySms.do?menuSn=34&firstYn=Y'
-        );
+      const channels = getTargetChannels();
+      for (let i = 0; i < channels.length; i += CFG.BROADCAST_CHUNK) {
+        const chunk = channels.slice(i, i + CFG.BROADCAST_CHUNK);
         
-        const rows = data.match(/<tbody[^>]*>[\s\S]*?<\/tbody>/g) || [];
-        const items = [];
-        
-        for (const tbody of rows) {
-          const trs = tbody.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
-          
-          for (const tr of trs.slice(0, 20)) {
-            const tds = tr.match(/<td[^>]*>([\s\S]*?)<\/td>/g) || [];
+        await Promise.allSettled(chunk.map(async id => {
+          try {
+            let ch = discordClient.channels.cache.get(id);
+            if (!ch) ch = await discordClient.channels.fetch(id).catch(() => null);
             
-            if (tds.length >= 3) {
-              const clean = (str) => {
-                return str
-                  .replace(/<[^>]*>/g, '')
-                  .replace(/&nbsp;/g, ' ')
-                  .replace(/&lt;/g, '<')
-                  .replace(/&gt;/g, '>')
-                  .replace(/&quot;/g, '"')
-                  .replace(/&#39;/g, "'")
-                  .replace(/&amp;/g, '&')
-                  .trim();
-              };
-              
-              const title = clean(tds[0]);
-              const area = clean(tds[1]);
-              const levelText = clean(tds[2]);
-              
-              let level = 'SAFE';
-              if (levelText.includes('위급')) level = 'CRITICAL';
-              else if (levelText.includes('긴급')) level = 'URGENT';
-              
-              if (title && area) {
-                items.push({ title, area, level, time: Date.now() });
+            if (ch?.isTextBased()) {
+              const perms = ch.permissionsFor(discordClient.user);
+              if (perms && perms.has(PermissionsBitField.Flags.SendMessages)) {
+                await ch.send(payload);
               }
             }
-          }
-        }
+          } catch (e) {}
+        }));
         
-        return items;
-      }, 'SAFE')
-    );
-
-    metrics.recordApiCall('SAFE', Date.now() - start);
-
-    for (const e of items || []) {
-      const id = `${sane(e.title, 100)}_${sane(e.area, 50)}_${e.level}`;
-      if (SENT.safe.has(id)) continue;
-
-      SENT.safe.set(id, Date.now());
-      if (SENT.safe.size > CFG.CACHE.SENT_MAX) {
-        SENT.safe.delete(SENT.safe.keys().next().value);
-      }
-      metrics.addEq();
-
-      const config = CFG.EMERGENCY[e.level];
-      const embed = buildSafeEmbed(e.title, '', e.area, e.level);
-
-      if (config.mention && e.level === 'URGENT') {
-        broadcast({ content: '@everyone', embeds: [embed], tempDelete: false });
-      } else if (config.mention && e.level === 'CRITICAL') {
-        for (let i = 0; i < config.repeats; i++) {
-          broadcast({ content: i === 0 ? '@everyone' : '', embeds: [embed], tempDelete: i > 0 }).catch(() => {});
-          if (i < config.repeats - 1) await new Promise(r => setTimeout(r, 500));
+        if (i + CFG.BROADCAST_CHUNK < channels.length) {
+          await new Promise(r => setTimeout(r, CFG.BROADCAST_DELAY));
         }
-      } else {
-        broadcast({ embeds: [embed] });
       }
+      resolve();
+    } catch (e) {
+      logger.error('Broadcast 에러', e);
+      reject(e);
     }
-
-    persistSent('safe');
-    TRK.safe.streak = 0;
-    TRK.safe.lastOk = new Date();
-  } catch (err) {
-    if (!err?.cbOpen) TRK.safe.streak++;
-    notifyErr('safe', err);
   }
+  isBroadcasting = false;
 }
 
 async function fetchKMA() {
-  if (!ENV.KMA_KEY) return;
-
   try {
-    const start = Date.now();
-    const rows = await CB.kma.exec(() =>
-      withRetry(async () => {
-        const now = new Date(Date.now() + 9 * 3_600_000);
-        const to = now.toISOString().slice(0, 10).replace(/-/g, '');
-        const from = new Date(+now - 2 * 86_400_000).toISOString().slice(0, 10).replace(/-/g, '');
+    const now = new Date(Date.now() + 9 * 3600000);
+    const to = now.toISOString().slice(0, 10).replace(/-/g, '');
+    const from = new Date(+now - 2 * 86400000).toISOString().slice(0, 10).replace(/-/g, '');
+    const url = `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=${encodeURIComponent(ENV.KMA_KEY)}&numOfRows=10&pageNo=1&dataType=JSON&fromTmFc=${from}&toTmFc=${to}`;
+    
+    const data = await fetchWithRetry(() => fetchJSON(url));
+    statusKma.ok();
 
-        const { data } = await HTTP.get(
-          `http://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg?serviceKey=${encodeURIComponent(ENV.KMA_KEY)}&numOfRows=10&pageNo=1&dataType=JSON&fromTmFc=${from}&toTmFc=${to}`
-        );
+    let items = data?.response?.body?.items?.item;
+    if (!items) return;
+    items = Array.isArray(items) ? items : [items];
 
-        const code = String(data?.response?.header?.resultCode || '');
-        if (code && !['00', '03'].includes(code)) throw new Error(`Code: ${code}`);
+    for (const e of items) {
+      if (!e) continue;
+      const id = `KMA_${e.tmEqk}_${e.tmSeq}`;
+      if (SENT_CACHE.has(id)) continue;
 
-        const raw = data?.response?.body?.items?.item;
-        return Array.isArray(raw) ? raw : raw ? [raw] : [];
-      }, 'KMA')
-    );
+      const lat = Number(e.lat) || null;
+      const lon = Number(e.lon) || null;
+      const mag = Number(e.mt) || null;
+      const t = parseKMATime(String(e.tmEqk));
 
-    metrics.recordApiCall('KMA', Date.now() - start);
+      if (!lat || !lon) continue;
+      if (isDuplicate({ lat, lon, mag, t })) { SENT_CACHE.set(id, Date.now()); continue; }
+      SENT_CACHE.set(id, Date.now());
 
-    for (const e of rows) {
-      const id = `${e.tmEqk}_${sane(e.loc, 100)}`;
-      if (!e.tmEqk || SENT.kma.has(id)) continue;
+      const mapLink = `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
+      const estInt = estimateIntensity(mag);
+      const color = mag >= 6 ? 0xCC0000 : mag >= 5 ? 0xFF6600 : mag >= 4 ? 0xFFAA00 : 0x00AAFF;
+      const emoji = mag >= 6 ? '🔴' : mag >= 5 ? '🟠' : mag >= 4 ? '🟡' : '🔵';
 
-      const mag = e.mt != null ? +e.mt : null;
-      const lat = e.tmLa != null ? +e.tmLa : null;
-      const lon = e.tmLo != null ? +e.tmLo : null;
+      const embed = new EmbedBuilder()
+        .setTitle(`${emoji} 기상청 지진 정보`)
+        .setColor(color)
+        .addFields(
+          { name: '📍 진원지', value: `${sanitize(e.loc, 100)}\n[🗺️ 구글 지도에서 보기](${mapLink})`, inline: false },
+          { name: '📈 규모', value: `M${mag.toFixed(1)}`, inline: true },
+          { name: '📉 깊이', value: `${e.dep || '? '}km`, inline: true },
+          { name: '⚠️ 예상 최대진도', value: estInt, inline: false }
+        )
+        .setTimestamp(t);
 
-      if (!getRegion(lat, lon)) continue;
-      
-      if (isDuplicate({ src: 'KMA', lat, lon, mag, time: Date.now() })) {
-        SENT.kma.set(id, Date.now());
-        continue;
-      }
+      if (e.rem) embed.addFields({ name: '📝 참고사항', value: sanitize(e.rem, 200), inline: false });
 
-      SENT.kma.set(id, Date.now());
-      if (SENT.kma.size > CFG.CACHE.SENT_MAX) {
-        SENT.kma.delete(SENT.kma.keys().next().value);
-      }
-      metrics.addEq();
-
-      const eq = new Earthquake({
-        id,
-        source: 'KMA',
-        location: e.loc,
-        latitude: lat,
-        longitude: lon,
-        magnitude: mag,
-        depth: e.dep != null ? +e.dep : null,
-        intensity: e.mtSt,
-        timestamp: new Date(String(e.tmEqk)).getTime(),
-      });
-
-      broadcast({ embeds: [buildEqEmbed(eq)] });
+      const payload = mag >= 5.0 ? { content: '@everyone 🚨 강진 발생!', embeds: [embed] } : { embeds: [embed] };
+      broadcastMessage(payload).catch(() => {});
     }
-
-    persistSent('kma');
-    TRK.kma.streak = 0;
-    TRK.kma.lastOk = new Date();
-  } catch (err) {
-    if (!err?.cbOpen) TRK.kma.streak++;
-    notifyErr('kma', err);
+    scheduleSave();
+  } catch (e) {
+    statusKma.fail();
   }
 }
 
 async function fetchJMA() {
   try {
-    const start = Date.now();
-    const data = await CB.jma.exec(() =>
-      withRetry(async () => {
-        const { data: raw } = await HTTP.get('https://www.jma.go.jp/bosai/quake/data/latest_quakes.json');
-        return raw;
-      }, 'JMA')
-    );
+    const data = await fetchWithRetry(() => fetchJSON('https://www.jma.go.jp/bosai/quake/data/latest_quakes.json'));
+    statusJma.ok();
+    
+    const items = Array.isArray(data) ? data : [];
+    for (const e of items.slice(0, 5)) {
+      if (!e) continue;
+      const id = `JMA_${e.id || e.eid}`;
+      if (SENT_CACHE.has(id)) continue;
 
-    metrics.recordApiCall('JMA', Date.now() - start);
-
-    if (data?.result?.data && Array.isArray(data.result.data)) {
-      for (const e of data.result.data.slice(0, 10)) {
-        const id = sane(e.id || '', 300);
-        if (!id || SENT.jma.has(id)) continue;
-
-        const lat = e.lat || null;
-        const lon = e.lon || null;
-
-        if (!getRegion(lat, lon)) continue;
-        
-        if (isDuplicate({ src: 'JMA', lat, lon, mag: e.mag, time: e.originTime })) {
-          SENT.jma.set(id, Date.now());
-          continue;
-        }
-
-        SENT.jma.set(id, Date.now());
-        if (SENT.jma.size > CFG.CACHE.SENT_MAX) {
-          SENT.jma.delete(SENT.jma.keys().next().value);
-        }
-        metrics.addEq();
-
-        const eq = new Earthquake({
-          id,
-          source: 'JMA',
-          location: e.locations?.[0]?.name || '미상',
-          latitude: lat,
-          longitude: lon,
-          magnitude: e.mag,
-          depth: e.depth,
-          intensity: e.intensity,
-          timestamp: e.originTime,
-        });
-
-        broadcast({ embeds: [buildEqEmbed(eq)] });
+      let lat = null, lon = null;
+      if (typeof e.lat === 'string' && e.lat.includes('+')) {
+        const match = e.lat.match(/([+-]\d+\.\d+)([+-]\d+\.\d+)/);
+        if (match) { lat = Number(match[1]); lon = Number(match[2]); }
+      } else {
+        lat = Number(e.lat); lon = Number(e.lon);
       }
-    }
+      
+      const mag = Number(e.mag) || null;
+      const t = new Date(e.originTime || e.at || Date.now()).getTime();
 
-    persistSent('jma');
-    TRK.jma.streak = 0;
-    TRK.jma.lastOk = new Date();
-  } catch (err) {
-    if (!err?.cbOpen) TRK.jma.streak++;
-    notifyErr('jma', err);
+      if (!lat || !lon) continue;
+      if (isDuplicate({ lat, lon, mag, t })) { SENT_CACHE.set(id, Date.now()); continue; }
+      SENT_CACHE.set(id, Date.now());
+
+      const mapLink = `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`;
+      const locName = e.en_loc || e.loc || (e.locations && e.locations[0]?.name) || '일본 해역/내륙';
+      const color = mag >= 6 ? 0xCC0000 : mag >= 5 ? 0xFF6600 : 0x00AAFF;
+
+      const embed = new EmbedBuilder()
+        .setTitle(`🇯🇵 일본 기상청 지진 정보`)
+        .setColor(color)
+        .addFields(
+          { name: '📍 진원지', value: `${sanitize(locName, 100)}\n[🗺️ 구글 지도에서 보기](${mapLink})`, inline: false },
+          { name: '📈 규모', value: `M${mag?.toFixed(1) || '?'}`, inline: true },
+          { name: '⚠️ 최대진도', value: sanitize(e.maxInt || e.intensity || '알 수 없음', 20), inline: true }
+        )
+        .setTimestamp(t);
+
+      broadcastMessage({ embeds: [embed] }).catch(() => {});
+    }
+    scheduleSave();
+  } catch (e) {
+    statusJma.fail();
   }
 }
 
-setInterval(async () => {
-  const now = Date.now();
-  for (const [key, data] of TEMP_MESSAGES) {
-    if (now - data.at > 10_000) {
-      for (const chId of data.channels) {
-        try {
-          const ch = await discord.channels.fetch(chId);
-          if (ch?.isTextBased()) {
-            for (const msgId of data.ids) {
-              try {
-                const msg = await ch.messages.fetch(msgId);
-                await msg.delete();
-              } catch {}
-            }
-          }
-        } catch {}
-      }
-      TEMP_MESSAGES.delete(key);
+async function fetchSafetyData() {
+  try {
+    const data = await fetchWithRetry(() => fetchJSON(`https://www.safetydata.go.kr/V2/api/DSSP-IF-00247?serviceKey=${encodeURIComponent(ENV.SAFETY_KEY)}&returnType=json&numOfRows=30`));
+    statusSafe.ok();
+    
+    let items = data?.body?.data || data?.data;
+    if (!items) return;
+    items = Array.isArray(items) ? items : [items];
+
+    for (const e of items) {
+      if (!e) continue;
+      const id = `SAFE_${sanitize(e.MD101_SN || e.id || '', 50)}`;
+      if (!id || SENT_CACHE.has(id)) continue;
+      SENT_CACHE.set(id, Date.now());
+
+      const level = (e.MSG_CN || '').includes('위급') ? 'CRITICAL' : (e.MSG_CN || '').includes('긴급') ? 'URGENT' : 'SAFE';
+      const colors = { SAFE: 0xFFDD00, URGENT: 0xFF8800, CRITICAL: 0xFF0000 };
+      
+      const embed = new EmbedBuilder()
+        .setTitle(sanitize(e.DSSTR_SE_NM || '재난 알림', 100))
+        .setColor(colors[level] || 0xFFDD00)
+        .setDescription(sanitize(e.MSG_CN || '', 1000))
+        .addFields({ name: '지역', value: sanitize(e.RCV_AREA_NM || '전국', 100), inline: true })
+        .setTimestamp();
+
+      const payload = level !== 'SAFE' ? { content: '@everyone', embeds: [embed] } : { embeds: [embed] };
+      broadcastMessage(payload).catch(() => {});
     }
+    scheduleSave();
+  } catch (e) {
+    statusSafe.fail();
   }
-}, 15_000).unref();
+}
 
-const CMDS = [
-  { name: '상태', description: '봇 상태' },
-  { name: '통계', description: '통계' },
-  { name: '알림', description: '알림채널', options: [{ name: 'ch', type: ApplicationCommandOptionType.Channel, required: true }] },
-  { name: '로그', description: '로그채널', options: [{ name: 'ch', type: ApplicationCommandOptionType.Channel, required: true }] },
-];
-
-discord.on(Events.InteractionCreate, async ix => {
-  if (!ix.isChatInputCommand()) return;
-  const { commandName: cmd, user, guild } = ix;
-  const isOwner = !ENV.OWNER_ID || user.id === ENV.OWNER_ID;
-
-  if (['알림', '로그'].includes(cmd) && !isOwner) {
-    return ix.reply({ content: '❌ OWNER전용', ephemeral: true }).catch(() => {});
-  }
+discordClient.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  const { commandName, guild } = interaction;
 
   try {
-    if (cmd === '상태') {
-      const up = process.uptime();
-      const wsPing = discord.ws.ping;
-
-      return ix.reply({
-        embeds: [new EmbedBuilder()
-          .setTitle('📊 봇상태')
-          .setColor(0x00FF99)
-          .addFields(
-            { name: '⚡ 핑', value: `${wsPing}ms`, inline: true },
-            { name: '⏱️ 가동', value: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m`, inline: true },
-            { name: '🌏 KMA', value: CB.kma.badge(), inline: true },
-            { name: '🗾 JMA', value: CB.jma.badge(), inline: true },
-            { name: '🛡️ SAFE', value: CB.safe.badge(), inline: true },
-          )
-          .setTimestamp()],
+    if (commandName === '상태') {
+      return interaction.reply({
+        embeds: [new EmbedBuilder().setTitle('📊 시스템 상태').setColor(0x00FF99).addFields(
+          { name: '⚡ 핑 (WS)', value: `${discordClient.ws.ping}ms`, inline: true },
+          { name: '⏱️ 가동 시간', value: `${Math.floor(process.uptime() / 3600)}시간`, inline: true },
+          { name: '📡 KMA (기상청)', value: statusKma.isDegraded() ? '❌ 오류' : '✅ 정상', inline: true },
+          { name: '📡 JMA (일본)', value: statusJma.isDegraded() ? '❌ 오류' : '✅ 정상', inline: true },
+          { name: '📡 SAFE (재난)', value: statusSafe.isDegraded() ? '❌ 오류' : '✅ 정상', inline: true },
+        ).setTimestamp()],
       });
     }
 
-    if (cmd === '통계') {
-      const stats = metrics.getStats();
-      return ix.reply({
-        embeds: [new EmbedBuilder()
-          .setTitle('📈 통계')
-          .setColor(0x5865F2)
-          .addFields(
-            { name: '메시지', value: String(stats.messages), inline: true },
-            { name: '메모리', value: `${stats.memory}MB`, inline: true },
-            { name: 'KMA', value: `${stats.avgResponseTime.KMA || 0}ms`, inline: true },
-            { name: 'JMA', value: `${stats.avgResponseTime.JMA || 0}ms`, inline: true },
-          )
-          .setTimestamp()],
-      });
-    }
-
-    if (cmd === '알림') {
-      const ch = ix.options.getChannel('ch');
-      const gid = guild?.id || 'global';
-      if (!GUILD_CFG.has(gid)) GUILD_CFG.set(gid, {});
-      GUILD_CFG.get(gid).alertChannel = ch.id;
-      persistConfig();
-      return ix.reply({ content: `✅ <#${ch.id}>`, ephemeral: true });
-    }
-
-    if (cmd === '로그') {
-      const ch = ix.options.getChannel('ch');
-      const gid = guild?.id || 'global';
-      if (!GUILD_CFG.has(gid)) GUILD_CFG.set(gid, {});
-      GUILD_CFG.get(gid).logChannel = ch.id;
-      persistConfig();
-      return ix.reply({ content: `✅ <#${ch.id}>`, ephemeral: true });
+    if (commandName === '알림') {
+      if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageGuild)) {
+        return interaction.reply({ content: '❌ 이 명령어를 사용할 권한(서버 관리하기)이 없습니다.', ephemeral: true });
+      }
+      const targetChannel = interaction.options.getChannel('channel');
+      const guildId = guild?.id || 'global';
+      
+      GUILD_MAP.set(guildId, targetChannel.id);
+      scheduleSave();
+      
+      return interaction.reply({ content: `✅ 이제부터 지진/재난 알림이 <#${targetChannel.id}> 채널로 전송됩니다.`, ephemeral: true });
     }
   } catch (e) {
-    await ix.reply({ content: '❌', ephemeral: true }).catch(() => {});
+    logger.error('명령어 처리 실패', e);
+    await interaction.reply({ content: '❌ 처리 중 오류가 발생했습니다.', ephemeral: true }).catch(() => {});
   }
 });
 
 const app = express();
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
-app.use(rateLimit({ windowMs: 15 * 60_000, max: 100 }));
-app.use(express.json({ limit: '5kb' }));
+app.use(rateLimit({ windowMs: 15 * 60_000, max: 50, standardHeaders: true, legacyHeaders: false }));
 
 app.get('/health', (_, res) => {
-  const healthy = !Object.values(CB).some(c => c.state === 'OPEN');
-  res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'ok' : 'degraded',
+  const isHealthy = !statusSafe.isDegraded() && !statusKma.isDegraded() && !statusJma.isDegraded();
+  res.status(isHealthy ? 200 : 503).json({
+    status: isHealthy ? 'ok' : 'degraded',
     uptime: Math.floor(process.uptime()),
-    memory: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
   });
 });
 
-app.get('/metrics', (_, res) => res.json(metrics.getStats()));
-app.use((_, res) => res.status(404).end());
+app.listen(ENV.PORT, '0.0.0.0', () => logger.log(`웹 서버 시작됨 (Port: ${ENV.PORT})`));
 
-const server = app.listen(ENV.PORT, () => mainLogger.info(`포트 ${ENV.PORT}`));
-
-discord.once(Events.ClientReady, async () => {
-  mainLogger.info(`로그인: ${discord.user.tag}`);
+discordClient.once(Events.ClientReady, async () => {
+  logger.log(`디스코드 로그인 완료: ${discordClient.user.tag}`);
   await initStorage();
 
-  const loops = [
-    { fn: fetchSafe, ms: CFG.MS.SAFE, id: 'safe' },
-    { fn: fetchKMA, ms: CFG.MS.KMA, id: 'kma' },
-    { fn: fetchJMA, ms: CFG.MS.JMA, id: 'jma' },
-  ];
-
-  loops.forEach(({ fn, ms, id }) => {
-    const tick = async () => {
-      try {
-        await fn();
-      } catch {}
-      const nextMs = TRK[id].streak > 0 || CB[id].state !== 'CLOSED' ? CFG.MS.ERR : ms;
-      setTimeout(tick, nextMs).unref();
-    };
-    setTimeout(tick, Math.random() * 3000).unref();
-  });
+  setInterval(async () => { try { await fetchSafetyData(); } catch (e) {} }, CFG.MS.SAFE);
+  setInterval(async () => { try { await fetchKMA(); } catch (e) {} }, CFG.MS.KMA);
+  setInterval(async () => { try { await fetchJMA(); } catch (e) {} }, CFG.MS.JMA);
 
   if (ENV.APPLICATION_ID) {
+    const SLASH_COMMANDS = [
+      { name: '상태', description: '봇의 현재 상태와 API 연동 상태를 확인합니다.' },
+      { name: '알림', description: '이 채널에 알림을 설정합니다. (관리자 전용)', options: [{ name: 'channel', type: ApplicationCommandOptionType.Channel, required: true }] },
+    ];
     const rest = new REST({ version: '10' }).setToken(ENV.DISCORD_TOKEN);
-    rest.put(Routes.applicationCommands(ENV.APPLICATION_ID), { body: CMDS }).catch(() => {});
+    rest.put(Routes.applicationCommands(ENV.APPLICATION_ID), { body: SLASH_COMMANDS }).catch(e => logger.error('명령어 등록 실패', e));
   }
 });
 
-async function shutdown() {
-  mainLogger.critical('종료중');
-  const timeout = setTimeout(() => mainLogger.fatal('강제종료'), CFG.SHUTDOWN_MS);
-  timeout.unref();
+discordClient.on(Events.Error, err => logger.error('디스코드 클라이언트 에러', err));
+process.on('unhandledRejection', err => logger.error('Unhandled Rejection', err));
 
-  try {
-    await new Promise(r => server.close(r));
-    await discord.destroy();
-    await Promise.all([persistSent('kma'), persistSent('jma'), persistSent('safe'), persistConfig()]);
-  } catch (e) {
-    mainLogger.error('종료오류');
-  } finally {
-    clearTimeout(timeout);
-    mainLogger.destroy();
-    process.exit(0);
+async function gracefulShutdown() {
+  logger.log('종료 시그널 수신, 안전하게 종료합니다...');
+  await discordClient.destroy();
+  
+  const now = Date.now();
+  for (const [id, timestamp] of SENT_CACHE.entries()) {
+    if (now - timestamp > CFG.CACHE_TTL) SENT_CACHE.delete(id);
   }
+  await safeSaveFile('sent.json', SENT_CACHE);
+  await safeSaveFile('guild.json', GUILD_MAP);
+  process.exit(0);
 }
 
-process.on('uncaughtException', e => mainLogger.fatal('Exception', e.message));
-process.on('unhandledRejection', e => mainLogger.fatal('Rejection', String(e)));
-process.once('SIGTERM', shutdown);
-process.once('SIGINT', shutdown);
+process.once('SIGTERM', gracefulShutdown);
+process.once('SIGINT', gracefulShutdown);
 
-discord.login(ENV.DISCORD_TOKEN).catch(e => mainLogger.fatal('로그인실패', e.message));
+discordClient.login(ENV.DISCORD_TOKEN).catch(e => logger.error('로그인 실패', e));
