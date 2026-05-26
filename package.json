@@ -1,35 +1,23 @@
 {
-  "name": "disaster-alert-bot",
-  "version": "12.0.0",
-  "description": "엔터프라이즈급 동아시아(한중일) 지진 & 재난 알림 + 안티 테러 및 도배 방지 봇",
-  "type": "module",
+  "name": "discord-disaster-alert-bot",
+  "version": "1.0.0",
+  "description": "한국/일본 기상청 지진 및 안전 안내 문자 디스코드 알림 봇",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "node --watch index.js"
   },
-  "keywords": [
-    "discord",
-    "bot",
-    "earthquake",
-    "disaster",
-    "antiraid",
-    "antispam",
-    "verification"
-  ],
-  "author": "",
-  "license": "MIT",
   "dependencies": {
-    "axios": "^1.7.9",
-    "discord.js": "^14.16.3",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "express-rate-limit": "^7.5.0",
-    "fast-xml-parser": "^4.5.1",
-    "helmet": "^8.0.0"
+    "discord.js": "^14.15.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "helmet": "^7.1.0"
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "author": "",
+  "license": "ISC"
 }
