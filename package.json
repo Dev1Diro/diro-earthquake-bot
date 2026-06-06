@@ -1,23 +1,13 @@
 {
-  "name": "discord-disaster-alert-bot",
+  "name": "render-earthquake-discord-bot",
   "version": "1.0.0",
-  "description": "한국/일본 기상청 지진 및 안전 안내 문자 디스코드 알림 봇",
-  "main": "index.js",
   "type": "module",
+  "private": true,
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index.js"
   },
-  "dependencies": {
-    "discord.js": "^14.15.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.3.1",
-    "helmet": "^7.1.0"
-  },
+  "dependencies": {},
   "engines": {
-    "node": ">=18.0.0"
-  },
-  "author": "",
-  "license": "ISC"
+    "node": ">=20"
+  }
 }
