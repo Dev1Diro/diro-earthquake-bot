@@ -7,7 +7,9 @@
     "start": "node index.js",
     "test": "node --test test/*.test.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "fast-xml-parser": "5.11.1"
+  },
   "engines": {
     "node": ">=20"
   }

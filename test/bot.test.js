@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
+import { XMLParser } from 'fast-xml-parser';
 
 const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const fixedNow = Date.parse('2026-09-25T15:05:00Z'); // Just after midnight KST.
@@ -13,7 +14,7 @@ class Clock extends Date {
 
 function loadBot(fetchImpl = async () => new Response('{}'), env = {}) {
   const context = vm.createContext({
-    crypto, dns: { setDefaultResultOrder() {} }, Date: Clock,
+    crypto, XMLParser, dns: { setDefaultResultOrder() {} }, Date: Clock,
     console: { log() {}, warn() {}, error() {} },
     process: {
       env: { DISCORD_TOKEN: 'test-token', CHANNEL_ID: '123456789012345678',
@@ -30,7 +31,7 @@ function loadBot(fetchImpl = async () => new Response('{}'), env = {}) {
     globalThis.bot = {
       getKmaRange, parseApiRecords, parseKstLikeTime, keyCandidates, buildUrl,
       checkKmaEarthquakes, checkSafetyMessages, runChecks, kmaId, wasSent,
-      handleHttp, verifyDiscordToken,
+      handleHttp, verifyDiscordToken, fetchTextWithKeyFallback,
       state: () => ({ lastKmaStatus, lastSafetyStatus, lastDiscordStatus, checksRunning }),
     };`, context);
   return context.bot;
@@ -154,4 +155,41 @@ test('one missing API key does not terminate the other source or health endpoint
   assert.equal(body.status, 'ok');
   assert.match(body.safety, /^disabled:/);
   assert.ok('discord' in body);
+});
+
+test('XML parser handles namespaces, numeric entities, CDATA, and string IDs', () => {
+  const bot = loadBot();
+  const rows = bot.parseApiRecords('<ns:response xmlns:ns="urn:test"><ns:body><ns:items><ns:item><SN>000123</SN><MSG_CN>&#xC9C0;&#xC9C4; &amp; 안내</MSG_CN></ns:item><ns:item><SN>000124</SN><MSG_CN><![CDATA[긴급 <안내>]]></MSG_CN></ns:item></ns:items></ns:body></ns:response>');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].SN, '000123');
+  assert.equal(rows[0].MSG_CN, '지진 & 안내');
+  assert.equal(rows[1].MSG_CN, '긴급 <안내>');
+  assert.throws(() => bot.parseApiRecords('<!DOCTYPE x><response/>'), /DOCTYPE/);
+});
+
+test('Safety IP denial is actionable, not retried as a key encoding problem, and recovers', async () => {
+  let denied = true;
+  let safetyRequests = 0;
+  let errorLogs = 0;
+  const bot = loadBot(async (url, options) => {
+    if (url.startsWith('https://discord.com')) {
+      const payload = JSON.parse(options.body);
+      if (payload.embeds[0].title === '봇 오류 로그') errorLogs++;
+      return new Response('{}');
+    }
+    if (url.startsWith('https://www.safetydata.go.kr')) {
+      safetyRequests++;
+      if (denied) return new Response('{"header":{"resultCode":"32","resultMsg":"UNREGISTERED IP ERROR"}}');
+    }
+    return new Response('{"header":{"resultCode":"00"},"body":[]}');
+  }, { SAFETY_KEY: 'a%2Bb', LOGS: '234567890123456789' });
+  await bot.runChecks();
+  assert.equal(safetyRequests, 1);
+  assert.match(bot.state().lastSafetyStatus, /Connect.*Outbound/);
+  await bot.runChecks();
+  assert.equal(safetyRequests, 2);
+  assert.equal(errorLogs, 1);
+  denied = false;
+  await bot.runChecks();
+  assert.match(bot.state().lastSafetyStatus, /^ok:/);
 });

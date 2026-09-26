@@ -41,3 +41,29 @@ Discord 봇에는 대상 채널의 보기, 메시지 보내기, 링크 임베드
 검증: `npm test` (외부 API와 실제 Discord 전송 없이 회귀 테스트 실행).
 
 API 명세: [기상청](https://apihub.kma.go.kr/apiList.do?seqApi=7), [긴급재난문자](https://www.safetydata.go.kr/disaster-data/view?dataSn=228).
+
+## 사용 패키지
+
+`fast-xml-parser` 5.11.1: XML 응답, 네임스페이스, CDATA, 문자 참조를 파싱합니다.
+버전은 `package.json`과 `package-lock.json`에 고정합니다. 저장소 루트에서는 `npm ci`로 설치할 수 있습니다.
+Render가 `quake-bot`을 Root Directory로 사용하면 해당 폴더의 `postinstall`이 루트 의존성도 설치합니다.
+
+## Safety API: IP 허용 안 됨
+
+이 오류는 API 서버의 접속 IP 검사에서 요청이 거부되었다는 뜻이며 패키지 교체로 해제되지 않습니다.
+실제 오류 예: `API 32: UNREGISTERED IP ERROR`.
+
+1. Render에서 봇 서비스 → **Connect → Outbound**를 엽니다.
+2. 표시된 공인 IP 목록/대역을 확인합니다. 웹 서비스 접속 주소나 개인 PC의 사설 IP를 등록하지 마세요.
+3. Safety 플랫폼의 해당 API 이용신청에서 허용 IP 설정을 확인하고 실제 Render 외부 통신 IP와 일치시킵니다.
+4. 플랫폼이 CIDR 대역을 받는지 확인하세요. Render는 표시된 대역 안에서 어떤 IP든 사용할 수 있습니다. 한 번 조회한 IP 하나만 등록하면 다시 실패할 수 있습니다.
+5. 등록 후 `/health`의 `safety`가 `ok:`로 바뀌는지 확인합니다. 봇은 다음 조회에서 자동으로 재시도합니다.
+
+Safety 공식 FAQ는 공인 IP 등록을 안내하고, `*.*.*.*`로 IP 제한 없이 사용하는 방식도 설명합니다.
+전체 IP 허용은 키에 대한 접속 제한을 줄이므로 현재 설정을 확인한 뒤 사용 여부를 선택하세요.
+봇은 허용 IP 설정을 자동으로 변경하지 않습니다.
+
+IP 거부는 키 인코딩을 바꿔 재시도하지 않으며, 같은 오류의 Discord 로그는 반복 전송하지 않습니다.
+`/health`에는 오류와 필요한 설정 안내를 계속 표시합니다. API가 다시 성공하면 정상 상태로 복귀합니다.
+
+참고: [Render 외부 통신 IP](https://render.com/docs/outbound-ip-addresses), [Safety FAQ: 등록되지 않은 IP](https://www.safetydata.go.kr/faq).

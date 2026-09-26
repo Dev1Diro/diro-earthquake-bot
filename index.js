@@ -1,12 +1,20 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
+import { XMLParser } from 'fast-xml-parser';
 
 dns.setDefaultResultOrder('ipv4first');
 
 const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const xmlParser = new XMLParser({
+  ignoreAttributes: true,
+  removeNSPrefix: true,
+  parseTagValue: false,
+  htmlEntities: true,
+  trimValues: true,
+});
 
 const T = Object.freeze({
   botErrorLog: '\ubd07 \uc624\ub958 \ub85c\uadf8',
@@ -307,6 +315,11 @@ async function fetchTextWithKeyFallback(base, apiKey, params = {}) {
 
       const bytes = new Uint8Array(await res.arrayBuffer());
       const text = decodeResponseText(bytes, res.headers.get('content-type'));
+      if (new URL(base).hostname === 'www.safetydata.go.kr' && isIpDeniedMessage(text)) {
+        const error = new Error('Safety API IP 허용 안 됨: Render 서비스의 Connect → Outbound 공인 IP를 Safety API 이용신청의 허용 IP에 등록해야 합니다.');
+        error.code = 'SAFETY_IP_NOT_ALLOWED';
+        throw error;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
 
       if (/SERVICE_KEY_IS_NOT_REGISTERED|SERVICE_KEY_IS_NOT_REGISTERED_ERROR|INVALID_REQUEST_PARAMETER_ERROR/i.test(text)) {
@@ -317,6 +330,7 @@ async function fetchTextWithKeyFallback(base, apiKey, params = {}) {
       parseApiRecords(text); // HTTP 200 may still contain an API error.
       return text;
     } catch (error) {
+      if (error.code === 'SAFETY_IP_NOT_ALLOWED') throw error;
       lastError = error;
     } finally {
       clearTimeout(timer);
@@ -345,33 +359,25 @@ function decodeResponseText(bytes, contentType = '') {
   return new TextDecoder().decode(bytes);
 }
 
-function decodeXml(value) {
-  return String(value ?? '')
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .trim();
+function isIpDeniedMessage(value) {
+  return /IP_IS_NOT_REGISTERED|IP_NOT_ALLOWED|(?:등록되지\s*않은|허용되지\s*않은)\s*(?:IP|아이피)|(?:unregistered|unauthorized)\s*IP|(?:IP|아이피)[^<>\n]{0,60}(?:허용.*않|등록.*않|등록되지|not\s*(?:allowed|registered)|denied|unauthorized)/i.test(String(value || ''));
 }
 
-function parseXmlRecords(xml) {
+function parseXmlRecords(data) {
   const records = [];
-  let blocks = [...xml.matchAll(/<(item|row)\b[^>]*>([\s\S]*?)<\/\1>/gi)];
-
-  if (!blocks.length) {
-    blocks = [...xml.matchAll(/<data\b[^>]*>([\s\S]*?)<\/data>/gi)].map((match) => [match[0], 'data', match[1]]);
-  }
-
-  for (const [, , block] of blocks) {
-    const record = {};
-    for (const match of block.matchAll(/<([A-Za-z0-9_]+)\b[^>]*>([\s\S]*?)<\/\1>/g)) {
-      record[match[1]] = decodeXml(match[2]);
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+      return;
     }
-    if (Object.keys(record).length) records.push(record);
+    if ('tmEqk' in node || 'MSG_CN' in node || 'msgCn' in node || ('loc' in node && 'mt' in node)) {
+      records.push(node);
+      return;
+    }
+    Object.values(node).forEach(visit);
   }
-
+  visit(data);
   return records;
 }
 
@@ -407,13 +413,15 @@ function parseApiRecords(text) {
     return extractJsonRecords(data);
   }
 
-  const code = trimmed.match(/<(?:resultCode|returnReasonCode)>\s*([^<]+)</i)?.[1];
-  const message = trimmed.match(/<(?:resultMsg|returnAuthMsg|errMsg)>\s*([^<]+)</i)?.[1];
-  assertApiResult(code, message);
-  if (/<(?:OpenAPI_ServiceResponse|html)\b/i.test(trimmed)) {
-    throw new Error(`API returned an error response: ${sanitize(message, 200)}`);
+  if (/<!DOCTYPE\b/i.test(trimmed)) throw new Error('API XML with DOCTYPE is not supported');
+  const data = xmlParser.parse(trimmed);
+  const root = data.response || data.OpenAPI_ServiceResponse || data;
+  const header = root.header || root.cmmMsgHeader || root;
+  assertApiResult(header.resultCode ?? header.returnReasonCode, header.resultMsg || header.returnAuthMsg || header.errMsg);
+  if (data.OpenAPI_ServiceResponse || data.html) {
+    throw new Error(`API returned an error response: ${sanitize(header.errMsg || header.returnAuthMsg, 200)}`);
   }
-  return parseXmlRecords(trimmed);
+  return parseXmlRecords(data);
 }
 
 function assertApiResult(code, message) {
@@ -667,8 +675,11 @@ async function runChecks() {
 
     if (safetyResult.status === 'rejected') {
       const error = safetyResult.reason;
+      const previousStatus = lastSafetyStatus;
       lastSafetyStatus = `error: ${error?.message || error}`;
-      await log('ERROR', 'Safety API check failed', error);
+      if (error?.code !== 'SAFETY_IP_NOT_ALLOWED' || previousStatus !== lastSafetyStatus) {
+        await log('ERROR', 'Safety API check failed', error);
+      }
     }
   } while (rerunRequested);
 

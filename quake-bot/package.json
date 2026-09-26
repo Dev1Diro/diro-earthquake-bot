@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "postinstall": "npm ci --prefix .. --ignore-scripts",
     "start": "node index.js"
   },
   "engines": {
