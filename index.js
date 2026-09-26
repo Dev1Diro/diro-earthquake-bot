@@ -43,7 +43,7 @@ const ENV = Object.freeze({
   PORT: Number(process.env.PORT) || 3000,
 });
 
-for (const name of ['DISCORD_TOKEN', 'KMA_KEY', 'SAFETY_KEY', 'CHANNEL_ID']) {
+for (const name of ['DISCORD_TOKEN', 'CHANNEL_ID']) {
   if (!ENV[name]) {
     console.error(`${name} env var is missing.`);
     process.exit(1);
@@ -60,7 +60,8 @@ if (ENV.LOGS && !isSnowflake(ENV.LOGS)) {
 }
 
 const CFG = Object.freeze({
-  CHECK_MS: FIVE_MINUTES_MS,
+  CHECK_MS: 60_000,
+  ALERT_MAX_AGE_MS: 30 * 60 * 1000,
   API_TIMEOUT_MS: 8000,
   DISCORD_TIMEOUT_MS: 7000,
   SENT_TTL_MS: ONE_DAY_MS,
@@ -79,6 +80,7 @@ let queueRunning = false;
 let firstSafetyCheck = true;
 let lastKmaStatus = 'booting';
 let lastSafetyStatus = 'booting';
+let lastDiscordStatus = 'booting';
 let lastCheckAt = null;
 let blockedRequests = 0;
 let checksRunning = false;
@@ -140,39 +142,44 @@ async function log(level, message, error) {
       },
     ],
     allowed_mentions: { parse: [] },
+  }).catch((sendError) => {
+    console.warn(`[LOG DELIVERY ERROR] ${sendError.message}`);
   });
 }
 
-async function enqueueDiscordMessage(channelId, payload) {
-  if (!channelId) return;
-
-  if (sendQueue.length >= CFG.DISCORD_QUEUE_MAX) {
-    console.warn(`[DISCORD QUEUE DROP] channel=${channelId}`);
-    return;
-  }
-
-  sendQueue.push({ channelId, payload });
-  if (!queueRunning) processDiscordQueue();
+function enqueueDiscordMessage(channelId, payload) {
+  return queueDiscordMessage(channelId, payload, false);
 }
 
-async function enqueuePriorityDiscordMessage(channelId, payload) {
-  if (!channelId) return;
+function enqueuePriorityDiscordMessage(channelId, payload) {
+  return queueDiscordMessage(channelId, payload, true);
+}
 
+function queueDiscordMessage(channelId, payload, priority) {
+  if (!channelId) return Promise.reject(new Error('Discord channel is missing'));
   if (sendQueue.length >= CFG.DISCORD_QUEUE_MAX) {
-    console.warn(`[DISCORD QUEUE DROP] channel=${channelId}`);
-    return;
+    return Promise.reject(new Error('Discord send queue is full'));
   }
 
-  sendQueue.unshift({ channelId, payload });
-  if (!queueRunning) processDiscordQueue();
+  return new Promise((resolve, reject) => {
+    const entry = { channelId, payload, resolve, reject };
+    if (priority) sendQueue.unshift(entry);
+    else sendQueue.push(entry);
+    if (!queueRunning) void processDiscordQueue();
+  });
 }
 
 async function processDiscordQueue() {
   queueRunning = true;
 
   while (sendQueue.length) {
-    const { channelId, payload } = sendQueue.shift();
-    await sendDiscordMessage(channelId, payload);
+    const { channelId, payload, resolve, reject } = sendQueue.shift();
+    try {
+      await sendDiscordMessage(channelId, payload);
+      resolve();
+    } catch (error) {
+      reject(error);
+    }
     await sleep(CFG.DISCORD_DELAY_MS);
   }
 
@@ -181,6 +188,7 @@ async function processDiscordQueue() {
 
 async function sendDiscordMessage(channelId, payload) {
   const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
+  let lastError;
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const controller = new AbortController();
@@ -200,7 +208,9 @@ async function sendDiscordMessage(channelId, payload) {
       if (res.status === 429) {
         const body = await safeJson(res);
         const retryAfterMs = Math.ceil(Number(body?.retry_after || 1) * 1000);
-        await sleep(Math.min(retryAfterMs, 5000));
+        lastError = new Error('Discord rate limit exceeded');
+        clearTimeout(timer);
+        await sleep(retryAfterMs);
         continue;
       }
 
@@ -209,8 +219,10 @@ async function sendDiscordMessage(channelId, payload) {
         throw new Error(`Discord HTTP ${res.status}: ${text.slice(0, 200)}`);
       }
 
+      lastDiscordStatus = 'ok';
       return;
     } catch (error) {
+      lastError = error;
       if (attempt === 2) {
         console.error(`[DISCORD SEND ERROR] channel=${channelId}`, error?.message || error);
       } else {
@@ -220,6 +232,8 @@ async function sendDiscordMessage(channelId, payload) {
       clearTimeout(timer);
     }
   }
+  lastDiscordStatus = `error: ${lastError?.message || 'message delivery failed'}`;
+  throw lastError || new Error('Discord message delivery failed');
 }
 
 async function safeJson(res) {
@@ -242,8 +256,10 @@ async function verifyDiscordToken() {
 
     if (!res.ok) throw new Error(`Discord HTTP ${res.status}`);
     const me = await res.json();
+    lastDiscordStatus = 'ok';
     await log('INFO', `Discord REST connected: ${me.username || me.id}`);
   } catch (error) {
+    lastDiscordStatus = `error: ${error.message}`;
     await log('ERROR', 'Discord REST connection failed', error);
   } finally {
     clearTimeout(timer);
@@ -255,16 +271,13 @@ function keyCandidates(rawKey) {
   const raw = String(rawKey || '').trim();
   if (!raw) return [];
 
-  set.add(raw);
-  set.add(encodeURIComponent(raw));
-
   try {
     const decoded = decodeURIComponent(raw);
-    set.add(decoded);
     set.add(encodeURIComponent(decoded));
   } catch {
-    // Keep original candidates when the key is not URI-encoded.
+    set.add(encodeURIComponent(raw));
   }
+  set.add(encodeURIComponent(raw));
 
   return [...set].filter(Boolean);
 }
@@ -301,6 +314,7 @@ async function fetchTextWithKeyFallback(base, apiKey, params = {}) {
         continue;
       }
 
+      parseApiRecords(text); // HTTP 200 may still contain an API error.
       return text;
     } catch (error) {
       lastError = error;
@@ -366,17 +380,19 @@ function extractJsonRecords(data) {
     data?.response?.body?.items?.item,
     data?.body?.items?.item,
     data?.body?.data,
+    data?.body,
     data?.items?.item,
     data?.item,
     data?.data,
-    data,
   ];
 
   for (const candidate of candidates) {
     if (Array.isArray(candidate)) return candidate;
-    if (candidate && typeof candidate === 'object') return [candidate];
+    if (candidate && typeof candidate === 'object' && ('tmEqk' in candidate || 'MSG_CN' in candidate || 'msgCn' in candidate)) return [candidate];
   }
 
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object' && ('tmEqk' in data || 'MSG_CN' in data)) return [data];
   return [];
 }
 
@@ -385,10 +401,27 @@ function parseApiRecords(text) {
   if (!trimmed) return [];
 
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return extractJsonRecords(JSON.parse(trimmed));
+    const data = JSON.parse(trimmed);
+    const header = data?.response?.header || data?.header || data;
+    assertApiResult(header.resultCode, header.resultMsg);
+    return extractJsonRecords(data);
   }
 
+  const code = trimmed.match(/<(?:resultCode|returnReasonCode)>\s*([^<]+)</i)?.[1];
+  const message = trimmed.match(/<(?:resultMsg|returnAuthMsg|errMsg)>\s*([^<]+)</i)?.[1];
+  assertApiResult(code, message);
+  if (/<(?:OpenAPI_ServiceResponse|html)\b/i.test(trimmed)) {
+    throw new Error(`API returned an error response: ${sanitize(message, 200)}`);
+  }
   return parseXmlRecords(trimmed);
+}
+
+function assertApiResult(code, message) {
+  if (code === undefined || code === null || code === '') return;
+  const value = String(code).trim();
+  if (['00', '0', '200', 'INFO-000', 'NORMAL_SERVICE'].includes(value)) return;
+  if (value === '03') return; // KMA: no data.
+  throw new Error(`API ${value}: ${sanitize(message, 200)}`);
 }
 
 function formatKstDate(date) {
@@ -400,12 +433,10 @@ function formatKstDate(date) {
 
 function getKmaRange() {
   const yesterdayKst = new Date(Date.now() + KST_OFFSET_MS - ONE_DAY_MS);
-  const oneYearAfterYesterdayKst = new Date(yesterdayKst);
-  oneYearAfterYesterdayKst.setUTCFullYear(oneYearAfterYesterdayKst.getUTCFullYear() + 1);
 
   return {
     fromTmFc: formatKstDate(yesterdayKst),
-    toTmFc: formatKstDate(oneYearAfterYesterdayKst),
+    toTmFc: formatKstDate(new Date(Date.now() + KST_OFFSET_MS)),
   };
 }
 
@@ -427,9 +458,8 @@ function parseKstLikeTime(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
 
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length >= 14) return parseKmaTime(digits.slice(0, 14));
-  if (digits.length === 12) return parseKmaTime(`${digits}00`);
+  if (/^\d{14}$/.test(raw)) return parseKmaTime(raw);
+  if (/^\d{12}$/.test(raw)) return parseKmaTime(`${raw}00`);
 
   const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
   const parsed = Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized) ? normalized : `${normalized}+09:00`);
@@ -439,6 +469,11 @@ function parseKstLikeTime(value) {
 function isWithinLastFiveMinutes(time) {
   const now = Date.now();
   return time && now - time <= FIVE_MINUTES_MS && time <= now + 60_000;
+}
+
+function isRecentAlert(time) {
+  const now = Date.now();
+  return Number.isFinite(time) && time > 0 && now - time <= CFG.ALERT_MAX_AGE_MS && time <= now + 60_000;
 }
 
 function kmaId(item) {
@@ -467,10 +502,15 @@ function intensityText(item, mag) {
 }
 
 async function checkKmaEarthquakes() {
+  if (!ENV.KMA_KEY) {
+    lastKmaStatus = 'disabled: KMA_KEY is missing';
+    return;
+  }
   const range = getKmaRange();
   const text = await fetchTextWithKeyFallback('https://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg', ENV.KMA_KEY, {
-    numOfRows: 10,
+    numOfRows: 100,
     pageNo: 1,
+    dataType: 'JSON',
     fromTmFc: range.fromTmFc,
     toTmFc: range.toTmFc,
   });
@@ -480,11 +520,11 @@ async function checkKmaEarthquakes() {
 
   for (const item of items) {
     const eventTime = parseKmaTime(item.tmEqk);
-    if (!isWithinLastFiveMinutes(eventTime)) continue;
+    const announcedTime = parseKstLikeTime(item.tmFc);
+    if (!eventTime || !isRecentAlert(announcedTime || eventTime)) continue;
 
     const id = kmaId(item);
     if (wasSent(id)) continue;
-    remember(id);
 
     const lat = Number(item.lat);
     const lon = Number(item.lon);
@@ -520,6 +560,7 @@ async function checkKmaEarthquakes() {
       allowed_mentions: { parse: ['everyone'] },
     });
 
+    remember(id);
     sent++;
   }
 
@@ -532,7 +573,7 @@ function safetyMessage(item) {
 }
 
 function safetyArea(item) {
-  return item.RCV_AREA_NM || item.areaNm || item.AREA_NM || item.region || T.nationwide;
+  return item.RCPTN_RGN_NM || item.RCV_AREA_NM || item.areaNm || item.AREA_NM || item.region || T.nationwide;
 }
 
 function safetyTitle(item) {
@@ -552,11 +593,20 @@ function safetyTime(item) {
 }
 
 async function checkSafetyMessages() {
-  const text = await fetchTextWithKeyFallback('https://www.safetydata.go.kr//V2/api/DSSP-IF-00247', ENV.SAFETY_KEY);
+  if (!ENV.SAFETY_KEY) {
+    lastSafetyStatus = 'disabled: SAFETY_KEY is missing';
+    return;
+  }
+  const text = await fetchTextWithKeyFallback('https://www.safetydata.go.kr/V2/api/DSSP-IF-00247', ENV.SAFETY_KEY, {
+    returnType: 'json',
+    numOfRows: 100,
+    pageNo: 1,
+    crtDt: getKmaRange().fromTmFc,
+  });
   const items = parseApiRecords(text);
   let sent = 0;
 
-  for (const item of items.slice(0, 30)) {
+  for (const item of items) {
     const message = safetyMessage(item);
     if (!message) continue;
 
@@ -564,12 +614,10 @@ async function checkSafetyMessages() {
     if (wasSent(id)) continue;
 
     const messageTime = safetyTime(item);
-    if (firstSafetyCheck && (!messageTime || Date.now() - messageTime > FIVE_MINUTES_MS)) {
+    if (!isRecentAlert(messageTime) || (firstSafetyCheck && !isWithinLastFiveMinutes(messageTime))) {
       remember(id);
       continue;
     }
-
-    remember(id);
 
     await enqueuePriorityDiscordMessage(ENV.CHANNEL_ID, {
       content: T.safetyContent,
@@ -585,6 +633,7 @@ async function checkSafetyMessages() {
       allowed_mentions: { parse: ['everyone'] },
     });
 
+    remember(id);
     sent++;
   }
 
@@ -713,6 +762,7 @@ function handleHttp(req, res) {
       lastCheckAt,
       kma: lastKmaStatus,
       safety: lastSafetyStatus,
+      discord: lastDiscordStatus,
       queuedMessages: sendQueue.length,
       blockedRequests,
     });
@@ -735,5 +785,5 @@ server.listen(ENV.PORT, '0.0.0.0', async () => {
   console.log(`Render web server started on port ${ENV.PORT}`);
   await verifyDiscordToken();
   await runChecks();
-  setInterval(runChecks, FIVE_MINUTES_MS);
+  setInterval(runChecks, CFG.CHECK_MS);
 });
