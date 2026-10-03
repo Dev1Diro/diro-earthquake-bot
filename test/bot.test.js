@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import crypto from 'node:crypto';
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { configureSecrets, redact } from '../security.js';
 
 const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const fixedNow = Date.parse('2026-09-25T15:05:00Z'); // Just after midnight KST.
@@ -14,7 +15,7 @@ class Clock extends Date {
 
 function loadBot(fetchImpl = async () => new Response('{}'), env = {}) {
   const context = vm.createContext({
-    crypto, XMLParser, dns: { setDefaultResultOrder() {} }, Date: Clock,
+    crypto, XMLParser, XMLValidator, configureSecrets, redact, dns: { setDefaultResultOrder() {} }, Date: Clock,
     console: { log() {}, warn() {}, error() {} },
     process: {
       env: { DISCORD_TOKEN: 'test-token', CHANNEL_ID: '123456789012345678',
@@ -31,7 +32,10 @@ function loadBot(fetchImpl = async () => new Response('{}'), env = {}) {
     globalThis.bot = {
       getKmaRange, parseApiRecords, parseKstLikeTime, keyCandidates, buildUrl,
       checkKmaEarthquakes, checkSafetyMessages, runChecks, kmaId, wasSent,
-      handleHttp, verifyDiscordToken, fetchTextWithKeyFallback,
+      handleHttp, fetchTextWithKeyFallback,
+      allowHttpRequest, clientIp,
+      fetchApiPages, safetyId,
+      bucketCount: () => httpBuckets.size,
       state: () => ({ lastKmaStatus, lastSafetyStatus, lastDiscordStatus, checksRunning }),
     };`, context);
   return context.bot;
@@ -192,4 +196,100 @@ test('Safety IP denial is actionable, not retried as a key encoding problem, and
   denied = false;
   await bot.runChecks();
   assert.match(bot.state().lastSafetyStatus, /^ok:/);
+});
+
+test('JSON service errors, invalid XML and unsupported response bodies are never healthy empty results', () => {
+  const bot = loadBot();
+  for (const code of ['10', '12', '22', '30']) {
+    assert.throws(() => bot.parseApiRecords(JSON.stringify({ OpenAPI_ServiceResponse: { cmmMsgHeader: { returnReasonCode: code, returnAuthMsg: 'API error' } } })), new RegExp(`API ${code}`));
+  }
+  for (const body of ['', 'UPSTREAM SERVER UNAVAILABLE', '{"unexpected":true}', '<response><body></response>']) assert.throws(() => bot.parseApiRecords(body));
+});
+
+test('a failed alert does not starve later alerts and only successful sends are remembered', async () => {
+  const second = { ...kmaItem(), tmSeq: '2', loc: '두 번째 진앙' };
+  let attempts = 0;
+  const bot = loadBot(async (url, options) => {
+    if (!url.startsWith('https://discord.com')) return new Response(JSON.stringify([kmaItem(), second]));
+    attempts++;
+    const first = JSON.parse(options.body).embeds[0].fields[0].value === '테스트 진앙';
+    return new Response('{}', { status: first ? 400 : 200 });
+  });
+  await assert.rejects(bot.checkKmaEarthquakes(), /failed=1, sent=1/);
+  assert.equal(attempts, 2);
+  assert.equal(bot.wasSent(bot.kmaId(kmaItem())), false);
+  assert.equal(bot.wasSent(bot.kmaId(second)), true);
+});
+
+test('extreme Discord rate limits fail promptly rather than freezing polling', async () => {
+  let requests = 0;
+  const bot = loadBot(async url => {
+    if (!url.startsWith('https://discord.com')) return new Response(JSON.stringify([kmaItem()]));
+    requests++;
+    return new Response('{"retry_after":86400}', { status: 429 });
+  });
+  await assert.rejects(bot.checkKmaEarthquakes(), /next poll/);
+  assert.equal(requests, 1);
+});
+
+test('successful polling keeps fetched telemetry out of the guild log channel and defaults to no ping', async () => {
+  const payloads = [];
+  const bot = loadBot(async (url, options) => {
+    if (!url.startsWith('https://discord.com')) return new Response(JSON.stringify([kmaItem()]));
+    payloads.push(JSON.parse(options.body));
+    assert.match(url, /123456789012345678\/messages$/);
+    return new Response('{}');
+  }, { LOGS: '234567890123456789' });
+  await bot.checkKmaEarthquakes();
+  assert.equal(payloads.length, 1);
+  assert.deepEqual(payloads[0].allowed_mentions.parse, []);
+  assert.doesNotMatch(payloads[0].content, /@everyone/);
+});
+
+test('pagination retrieves alerts after the first API page', async () => {
+  const pages = [];
+  const bot = loadBot(async url => {
+    const page = Number(new URL(url).searchParams.get('pageNo'));
+    pages.push(page);
+    return new Response(JSON.stringify({ response: { header: { resultCode: '00' }, body: { totalCount: 3, items: { item: page === 1 ? [{ id: 1 }, { id: 2 }] : [{ id: 3 }] } } } }));
+  });
+  const records = await bot.fetchApiPages('https://example.test/api', 'test-key', { numOfRows: 2 });
+  assert.equal(records.length, 3);
+  assert.deepEqual(pages, [1, 2]);
+});
+
+test('future safety notifications remain eligible for a subsequent poll', async () => {
+  const item = { SN: 'future', MSG_CN: '안내', CRT_DT: '2026-09-26 00:08:00' };
+  const bot = loadBot(async () => new Response(JSON.stringify({ header: { resultCode: '00' }, body: [item] })));
+  await bot.checkSafetyMessages();
+  assert.equal(bot.wasSent(bot.safetyId(item)), false);
+});
+
+test('malformed request targets return 400 and attacker Host cannot crash the listener', () => {
+  const bot = loadBot();
+  for (const [target, expected] of [['/health', 200], ['/%ZZ', 400], ['//evil.test/', 400], ['/%2eenv', 403]]) {
+    let status;
+    bot.handleHttp({ url: target, method: 'GET', headers: { host: '[', 'x-forwarded-for': 'spoof' }, socket: { remoteAddress: '127.0.0.1' } }, { setHeader() {}, writeHead(code) { status = code; }, end() {} });
+    assert.equal(status, expected);
+  }
+});
+
+test('forwarded address spoofing does not bypass limits and bucket memory is bounded', () => {
+  const bot = loadBot();
+  for (let i = 0; i < 25; i++) {
+    const ip = bot.clientIp({ headers: { 'x-forwarded-for': `1.2.3.${i}` }, socket: { remoteAddress: '10.0.0.1' } });
+    assert.equal(ip, '10.0.0.1');
+    assert.equal(bot.allowHttpRequest(ip), i < 24);
+  }
+  for (let i = 0; i < 1200; i++) bot.allowHttpRequest(`unique-${i}`);
+  assert.equal(bot.bucketCount(), 1000);
+});
+
+test('public health conceals upstream error bodies including configured secrets', async () => {
+  const bot = loadBot(async () => new Response('{"header":{"resultCode":"30","resultMsg":"test+kma/key="}}'));
+  await bot.runChecks();
+  let body;
+  bot.handleHttp({ url: '/health', method: 'GET', headers: {}, socket: { remoteAddress: '127.0.0.1' } }, { setHeader() {}, writeHead() {}, end(text) { body = text; } });
+  assert.doesNotMatch(body, /test\+kma|test-token|test-safety/);
+  assert.equal(JSON.parse(body).kma, 'error: see server logs or /status');
 });

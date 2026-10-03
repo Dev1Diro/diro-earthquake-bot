@@ -1,7 +1,10 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
+import { createDiscordRuntime } from './discord-runtime.js';
+import { StateStore } from './state-store.js';
+import { configureSecrets, redact } from './security.js';
 
 dns.setDefaultResultOrder('ipv4first');
 
@@ -48,8 +51,14 @@ const ENV = Object.freeze({
   SAFETY_KEY: cleanEnv('SAFETY_KEY'),
   CHANNEL_ID: cleanEnv('CHANNEL_ID') || firstCsvValue(process.env.CHANNEL_IDS),
   LOGS: cleanEnv('LOGS') || cleanEnv('logs') || cleanEnv('LOG_CHANNEL_ID'),
+  GUILD_ID: cleanEnv('GUILD_ID'),
+  DATA_DIR: cleanEnv('DATA_DIR') || '.data',
+  ALERT_MENTION_EVERYONE: cleanEnv('ALERT_MENTION_EVERYONE') === 'true',
+  TRUST_PROXY: cleanEnv('TRUST_PROXY') === 'true',
   PORT: Number(process.env.PORT) || 3000,
 });
+
+configureSecrets([ENV.DISCORD_TOKEN, ENV.KMA_KEY, ENV.SAFETY_KEY]);
 
 for (const name of ['DISCORD_TOKEN', 'CHANNEL_ID']) {
   if (!ENV[name]) {
@@ -78,6 +87,8 @@ const CFG = Object.freeze({
   HTTP_RATE_BURST: 24,
   HTTP_RATE_REFILL_PER_SEC: 0.5,
   MAX_URL_LENGTH: 240,
+  HTTP_BUCKET_MAX: 1000,
+  MAX_RESPONSE_BYTES: 2 * 1024 * 1024,
 });
 
 const sentIds = new Map();
@@ -88,11 +99,14 @@ let queueRunning = false;
 let firstSafetyCheck = true;
 let lastKmaStatus = 'booting';
 let lastSafetyStatus = 'booting';
-let lastDiscordStatus = 'booting';
+let lastDiscordStatus = 'idle: no alert sent yet';
 let lastCheckAt = null;
 let blockedRequests = 0;
 let checksRunning = false;
 let rerunRequested = false;
+let stateStore = null;
+let discordRuntime = null;
+const errorLogTimes = new Map();
 
 function cleanEnv(name) {
   return process.env[name]?.trim() || '';
@@ -107,7 +121,7 @@ function isSnowflake(value) {
 }
 
 function sanitize(value, max = 1000) {
-  const text = String(value ?? '').replace(/[<>"'`\x00-\x1f]/g, '').trim();
+  const text = redact(value).replace(/[<>"'`\x00-\x1f]/g, '').trim();
   return text.slice(0, max) || T.noInfo;
 }
 
@@ -119,8 +133,16 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function remember(id) {
+async function remember(id) {
   const now = Date.now();
+  if (stateStore) {
+    await stateStore.update(state => {
+      state.alerts[`${ENV.CHANNEL_ID}:${id}`] = now;
+      for (const [key, at] of Object.entries(state.alerts)) {
+        if (!Number.isFinite(at) || now - at > CFG.SENT_TTL_MS) delete state.alerts[key];
+      }
+    });
+  }
   sentIds.set(id, now);
 
   for (const [key, at] of sentIds.entries()) {
@@ -133,10 +155,13 @@ function wasSent(id) {
 }
 
 async function log(level, message, error) {
-  const line = `[${nowIso()}] [${level}] ${message}${error ? ` - ${error?.message || error}` : ''}`;
+  const line = redact(`[${nowIso()}] [${level}] ${message}${error ? ` - ${error?.message || error}` : ''}`);
   console.log(line);
-
-  if (!ENV.LOGS || !isSnowflake(ENV.LOGS)) return;
+  // LOGS is for guild events and moderation. Polling telemetry stays in stdout.
+  if (level !== 'ERROR' || !ENV.LOGS || !isSnowflake(ENV.LOGS)) return;
+  const previous = errorLogTimes.get(message) || 0;
+  if (Date.now() - previous < 10 * 60_000) return;
+  errorLogTimes.set(message, Date.now());
 
   const fields = error ? [{ name: T.detail, value: sanitize(error?.message || error, 900), inline: false }] : [];
   await enqueueDiscordMessage(ENV.LOGS, {
@@ -151,7 +176,7 @@ async function log(level, message, error) {
     ],
     allowed_mentions: { parse: [] },
   }).catch((sendError) => {
-    console.warn(`[LOG DELIVERY ERROR] ${sendError.message}`);
+    console.warn(`[LOG DELIVERY ERROR] ${redact(sendError.message)}`);
   });
 }
 
@@ -215,7 +240,13 @@ async function sendDiscordMessage(channelId, payload) {
 
       if (res.status === 429) {
         const body = await safeJson(res);
-        const retryAfterMs = Math.ceil(Number(body?.retry_after || 1) * 1000);
+        const retrySeconds = Number(body?.retry_after ?? 1);
+        if (!Number.isFinite(retrySeconds) || retrySeconds < 0 || retrySeconds > 5) {
+          const error = new Error('Discord rate limit: retry on the next poll');
+          error.noRetry = true;
+          throw error;
+        }
+        const retryAfterMs = Math.ceil(retrySeconds * 1000);
         lastError = new Error('Discord rate limit exceeded');
         clearTimeout(timer);
         await sleep(retryAfterMs);
@@ -223,16 +254,18 @@ async function sendDiscordMessage(channelId, payload) {
       }
 
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`Discord HTTP ${res.status}: ${text.slice(0, 200)}`);
+        const error = new Error(`Discord HTTP ${res.status}${res.status === 403 ? ': channel permissions missing' : ''}`);
+        error.noRetry = res.status >= 400 && res.status < 500;
+        throw error;
       }
 
-      lastDiscordStatus = 'ok';
+      if (channelId === ENV.CHANNEL_ID) lastDiscordStatus = 'ok';
       return;
     } catch (error) {
       lastError = error;
+      if (error.noRetry) break;
       if (attempt === 2) {
-        console.error(`[DISCORD SEND ERROR] channel=${channelId}`, error?.message || error);
+        console.error(`[DISCORD SEND ERROR] channel=${channelId}`, redact(error?.message || error));
       } else {
         await sleep(500 * (attempt + 1));
       }
@@ -240,7 +273,7 @@ async function sendDiscordMessage(channelId, payload) {
       clearTimeout(timer);
     }
   }
-  lastDiscordStatus = `error: ${lastError?.message || 'message delivery failed'}`;
+  if (channelId === ENV.CHANNEL_ID) lastDiscordStatus = `error: ${redact(lastError?.message || 'message delivery failed')}`;
   throw lastError || new Error('Discord message delivery failed');
 }
 
@@ -249,28 +282,6 @@ async function safeJson(res) {
     return await res.json();
   } catch {
     return null;
-  }
-}
-
-async function verifyDiscordToken() {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CFG.DISCORD_TIMEOUT_MS);
-
-  try {
-    const res = await fetch('https://discord.com/api/v10/users/@me', {
-      signal: controller.signal,
-      headers: { Authorization: `Bot ${ENV.DISCORD_TOKEN}` },
-    });
-
-    if (!res.ok) throw new Error(`Discord HTTP ${res.status}`);
-    const me = await res.json();
-    lastDiscordStatus = 'ok';
-    await log('INFO', `Discord REST connected: ${me.username || me.id}`);
-  } catch (error) {
-    lastDiscordStatus = `error: ${error.message}`;
-    await log('ERROR', 'Discord REST connection failed', error);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -313,17 +324,17 @@ async function fetchTextWithKeyFallback(base, apiKey, params = {}) {
         headers: { Accept: 'application/json, application/xml, text/xml, text/plain' },
       });
 
-      const bytes = new Uint8Array(await res.arrayBuffer());
+      const bytes = await readLimitedResponse(res);
       const text = decodeResponseText(bytes, res.headers.get('content-type'));
       if (new URL(base).hostname === 'www.safetydata.go.kr' && isIpDeniedMessage(text)) {
         const error = new Error('Safety API IP 허용 안 됨: Render 서비스의 Connect → Outbound 공인 IP를 Safety API 이용신청의 허용 IP에 등록해야 합니다.');
         error.code = 'SAFETY_IP_NOT_ALLOWED';
         throw error;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${sanitize(text, 200)}`);
 
       if (/SERVICE_KEY_IS_NOT_REGISTERED|SERVICE_KEY_IS_NOT_REGISTERED_ERROR|INVALID_REQUEST_PARAMETER_ERROR/i.test(text)) {
-        lastError = new Error(text.slice(0, 300));
+        lastError = new Error(sanitize(text, 300));
         continue;
       }
 
@@ -340,6 +351,29 @@ async function fetchTextWithKeyFallback(base, apiKey, params = {}) {
   throw lastError || new Error('API request failed');
 }
 
+async function readLimitedResponse(res) {
+  const reader = res.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.length;
+      if (length > CFG.MAX_RESPONSE_BYTES) throw new Error('API response exceeds size limit');
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+  return bytes;
+}
+
 function decodeResponseText(bytes, contentType = '') {
   const utf8Preview = new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(0, 300));
   const xmlEncoding = utf8Preview.match(/encoding=["']([^"']+)["']/i)?.[1];
@@ -350,7 +384,7 @@ function decodeResponseText(bytes, contentType = '') {
 
   for (const encoding of [...new Set(encodings)]) {
     try {
-      return new TextDecoder(encoding, { fatal: false }).decode(bytes);
+      return new TextDecoder(encoding, { fatal: true }).decode(bytes);
     } catch {
       // Try the next encoding.
     }
@@ -404,16 +438,26 @@ function extractJsonRecords(data) {
 
 function parseApiRecords(text) {
   const trimmed = text.trim();
-  if (!trimmed) return [];
+  if (!trimmed) throw new Error('API returned an empty response');
 
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     const data = JSON.parse(trimmed);
+    if (data?.OpenAPI_ServiceResponse) {
+      const header = data.OpenAPI_ServiceResponse.cmmMsgHeader || {};
+      assertApiResult(header.returnReasonCode, header.returnAuthMsg || header.errMsg);
+      throw new Error('API returned a service error');
+    }
+    if (!Array.isArray(data) && (!data || typeof data !== 'object' || !['response', 'header', 'body', 'items', 'item', 'data', 'tmEqk', 'MSG_CN', 'msgCn'].some(key => key in data))) {
+      throw new Error('API returned an unsupported JSON response');
+    }
     const header = data?.response?.header || data?.header || data;
     assertApiResult(header.resultCode, header.resultMsg);
     return extractJsonRecords(data);
   }
 
+  if (!trimmed.startsWith('<') || !/<\/?(?:[\w-]+:)?(?:response|OpenAPI_ServiceResponse|body|item|items)\b/i.test(trimmed)) throw new Error('API returned an unsupported response');
   if (/<!DOCTYPE\b/i.test(trimmed)) throw new Error('API XML with DOCTYPE is not supported');
+  if (XMLValidator.validate(trimmed) !== true) throw new Error('API returned invalid XML');
   const data = xmlParser.parse(trimmed);
   const root = data.response || data.OpenAPI_ServiceResponse || data;
   const header = root.header || root.cmmMsgHeader || root;
@@ -422,6 +466,23 @@ function parseApiRecords(text) {
     throw new Error(`API returned an error response: ${sanitize(header.errMsg || header.returnAuthMsg, 200)}`);
   }
   return parseXmlRecords(data);
+}
+
+async function fetchApiPages(base, apiKey, params) {
+  const result = [];
+  const maximumPages = 20;
+  for (let page = 1; page <= maximumPages; page++) {
+    const text = await fetchTextWithKeyFallback(base, apiKey, { ...params, pageNo: page });
+    const records = parseApiRecords(text);
+    result.push(...records);
+    const parsed = text.trim().startsWith('<') ? xmlParser.parse(text) : JSON.parse(text);
+    const countValue = parsed?.response?.body?.totalCount ?? parsed?.body?.totalCount ?? parsed?.totalCount;
+    const total = countValue === undefined ? null : Number(countValue);
+    if (total !== null && (!Number.isSafeInteger(total) || total < 0)) throw new Error('API returned invalid totalCount');
+    if ((total !== null && result.length >= total) || records.length < Number(params.numOfRows)) return result;
+    if (page === maximumPages) throw new Error('API pagination limit exceeded; data may be incomplete');
+  }
+  return result;
 }
 
 function assertApiResult(code, message) {
@@ -515,7 +576,7 @@ async function checkKmaEarthquakes() {
     return;
   }
   const range = getKmaRange();
-  const text = await fetchTextWithKeyFallback('https://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg', ENV.KMA_KEY, {
+  const items = await fetchApiPages('https://apis.data.go.kr/1360000/EqkInfoService/getEqkMsg', ENV.KMA_KEY, {
     numOfRows: 100,
     pageNo: 1,
     dataType: 'JSON',
@@ -523,8 +584,8 @@ async function checkKmaEarthquakes() {
     toTmFc: range.toTmFc,
   });
 
-  const items = parseApiRecords(text);
   let sent = 0;
+  const failures = [];
 
   for (const item of items) {
     const eventTime = parseKmaTime(item.tmEqk);
@@ -558,20 +619,28 @@ async function checkKmaEarthquakes() {
       timestamp: new Date(eventTime).toISOString(),
     };
 
-    if (item.img && /^https?:\/\//i.test(item.img)) {
-      embed.image = { url: item.img };
+    if (item.img) {
+      try {
+        const image = new URL(String(item.img));
+        if (image.protocol === 'https:' && !image.username && !image.password && image.href.length < 2000) embed.image = { url: image.href };
+      } catch { /* Invalid optional image must not prevent an earthquake alert. */ }
     }
 
-    await enqueuePriorityDiscordMessage(ENV.CHANNEL_ID, {
-      content: T.earthquakeContent,
-      embeds: [embed],
-      allowed_mentions: { parse: ['everyone'] },
-    });
+    try {
+      await enqueuePriorityDiscordMessage(ENV.CHANNEL_ID, {
+        content: ENV.ALERT_MENTION_EVERYONE ? T.earthquakeContent : T.earthquakeContent.replace('@everyone ', ''),
+        embeds: [embed],
+        allowed_mentions: { parse: ENV.ALERT_MENTION_EVERYONE ? ['everyone'] : [] },
+      });
 
-    remember(id);
-    sent++;
+      await remember(id);
+      sent++;
+    } catch (error) {
+      failures.push(redact(error.message));
+    }
   }
 
+  if (failures.length) throw new Error(`KMA delivery failed=${failures.length}, sent=${sent}: ${failures[0]}`);
   lastKmaStatus = `ok: fetched=${items.length}, sent=${sent}`;
   await log('INFO', `KMA check complete (${lastKmaStatus})`);
 }
@@ -605,14 +674,14 @@ async function checkSafetyMessages() {
     lastSafetyStatus = 'disabled: SAFETY_KEY is missing';
     return;
   }
-  const text = await fetchTextWithKeyFallback('https://www.safetydata.go.kr/V2/api/DSSP-IF-00247', ENV.SAFETY_KEY, {
+  const items = await fetchApiPages('https://www.safetydata.go.kr/V2/api/DSSP-IF-00247', ENV.SAFETY_KEY, {
     returnType: 'json',
     numOfRows: 100,
     pageNo: 1,
     crtDt: getKmaRange().fromTmFc,
   });
-  const items = parseApiRecords(text);
   let sent = 0;
+  const failures = [];
 
   for (const item of items) {
     const message = safetyMessage(item);
@@ -623,29 +692,36 @@ async function checkSafetyMessages() {
 
     const messageTime = safetyTime(item);
     if (!isRecentAlert(messageTime) || (firstSafetyCheck && !isWithinLastFiveMinutes(messageTime))) {
-      remember(id);
+      // Old items cannot become recent later; do not fill persistent storage with
+      // an entire day of stale notifications. Future items remain retryable.
+      if (firstSafetyCheck && isRecentAlert(messageTime) && messageTime <= Date.now()) await remember(id);
       continue;
     }
 
-    await enqueuePriorityDiscordMessage(ENV.CHANNEL_ID, {
-      content: T.safetyContent,
-      embeds: [
-        {
-          title: sanitize(safetyTitle(item), 100),
-          color: 0xffcc00,
-          description: sanitize(message, 1800),
-          fields: [{ name: T.area, value: sanitize(safetyArea(item), 200), inline: false }],
-          timestamp: messageTime ? new Date(messageTime).toISOString() : nowIso(),
-        },
-      ],
-      allowed_mentions: { parse: ['everyone'] },
-    });
+    try {
+      await enqueuePriorityDiscordMessage(ENV.CHANNEL_ID, {
+        content: ENV.ALERT_MENTION_EVERYONE ? T.safetyContent : T.safetyContent.replace('@everyone ', ''),
+        embeds: [
+          {
+            title: sanitize(safetyTitle(item), 100),
+            color: 0xffcc00,
+            description: sanitize(message, 1800),
+            fields: [{ name: T.area, value: sanitize(safetyArea(item), 200), inline: false }],
+            timestamp: messageTime ? new Date(messageTime).toISOString() : nowIso(),
+          },
+        ],
+        allowed_mentions: { parse: ENV.ALERT_MENTION_EVERYONE ? ['everyone'] : [] },
+      });
 
-    remember(id);
-    sent++;
+      await remember(id);
+      sent++;
+    } catch (error) {
+      failures.push(redact(error.message));
+    }
   }
 
   firstSafetyCheck = false;
+  if (failures.length) throw new Error(`Safety delivery failed=${failures.length}, sent=${sent}: ${failures[0]}`);
   lastSafetyStatus = `ok: fetched=${items.length}, sent=${sent}`;
   await log('INFO', `Safety check complete (${lastSafetyStatus})`);
 }
@@ -669,14 +745,14 @@ async function runChecks() {
 
     if (kmaResult.status === 'rejected') {
       const error = kmaResult.reason;
-      lastKmaStatus = `error: ${error?.message || error}`;
+      lastKmaStatus = `error: ${redact(error?.message || error)}`;
       await log('ERROR', 'KMA earthquake API check failed', error);
     }
 
     if (safetyResult.status === 'rejected') {
       const error = safetyResult.reason;
       const previousStatus = lastSafetyStatus;
-      lastSafetyStatus = `error: ${error?.message || error}`;
+      lastSafetyStatus = `error: ${redact(error?.message || error)}`;
       if (error?.code !== 'SAFETY_IP_NOT_ALLOWED' || previousStatus !== lastSafetyStatus) {
         await log('ERROR', 'Safety API check failed', error);
       }
@@ -688,12 +764,16 @@ async function runChecks() {
 
 function clientIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded) return forwarded.split(',')[0].trim();
+  if (ENV.TRUST_PROXY && typeof forwarded === 'string' && /^[\da-fA-F.:, ]{1,200}$/.test(forwarded)) return forwarded.split(',').at(-1).trim();
   return req.socket.remoteAddress || 'unknown';
 }
 
 function allowHttpRequest(ip) {
   const now = Date.now();
+  if (!httpBuckets.has(ip) && httpBuckets.size >= CFG.HTTP_BUCKET_MAX) {
+    for (const [key, value] of httpBuckets) if (now - value.at > 30 * 60_000) httpBuckets.delete(key);
+    if (httpBuckets.size >= CFG.HTTP_BUCKET_MAX) return false;
+  }
   const bucket = httpBuckets.get(ip) || { tokens: CFG.HTTP_RATE_BURST, at: now };
   const refill = ((now - bucket.at) / 1000) * CFG.HTTP_RATE_REFILL_PER_SEC;
 
@@ -759,11 +839,17 @@ function handleHttp(req, res) {
     return sendText(res, 414, 'uri too long');
   }
 
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  let url;
+  let pathname;
+  try {
+    if (!String(req.url || '/').startsWith('/') || String(req.url || '/').startsWith('//')) throw new Error('Invalid target');
+    url = new URL(req.url || '/', 'http://localhost');
+    pathname = decodeURIComponent(url.pathname);
+  } catch { return sendText(res, 400, 'bad request'); }
 
-  if (isSuspiciousPath(url.pathname)) {
+  if (isSuspiciousPath(pathname)) {
     blockedRequests++;
-    console.warn(`[BLOCKED HTTP] ip=${ip} path=${url.pathname}`);
+    console.warn(`[BLOCKED HTTP] ip=${ip}`);
     return sendText(res, 403, 'forbidden');
   }
 
@@ -771,9 +857,10 @@ function handleHttp(req, res) {
     return sendJson(res, 200, {
       status: 'ok',
       lastCheckAt,
-      kma: lastKmaStatus,
-      safety: lastSafetyStatus,
-      discord: lastDiscordStatus,
+      kma: publicStatus(lastKmaStatus),
+      safety: publicStatus(lastSafetyStatus),
+      discord: publicStatus(lastDiscordStatus),
+      discordConnection: discordRuntime?.health() || { gateway: 'starting', commands: 'pending', logs: 'pending' },
       queuedMessages: sendQueue.length,
       blockedRequests,
     });
@@ -786,15 +873,52 @@ function handleHttp(req, res) {
   return sendText(res, 404, 'not found');
 }
 
+function publicStatus(status) {
+  if (status.startsWith('error:')) return 'error: see server logs or /status';
+  return redact(status).slice(0, 200);
+}
+
 const server = http.createServer(handleHttp);
 server.maxHeadersCount = 32;
 server.requestTimeout = 5000;
 server.headersTimeout = 6000;
 server.keepAliveTimeout = 3000;
 
-server.listen(ENV.PORT, '0.0.0.0', async () => {
-  console.log(`Render web server started on port ${ENV.PORT}`);
-  await verifyDiscordToken();
-  await runChecks();
-  setInterval(runChecks, CFG.CHECK_MS);
+async function main() {
+  stateStore = await new StateStore(ENV.DATA_DIR).init();
+  const prefix = `${ENV.CHANNEL_ID}:`;
+  for (const [key, at] of Object.entries(stateStore.read().alerts)) {
+    if (key.startsWith(prefix) && Number.isFinite(at) && Date.now() - at <= CFG.SENT_TTL_MS) sentIds.set(key.slice(prefix.length), at);
+  }
+  discordRuntime = createDiscordRuntime({
+    env: ENV, store: stateStore,
+    getSourceStatus: () => ({ kma: lastKmaStatus, safety: lastSafetyStatus, discord: lastDiscordStatus }),
+    reportError: (scope, error) => console.error(`[${scope}] ${redact(error?.message || error)}`),
+  });
+  let pollingTimer;
+  server.on('error', error => { console.error(redact(error.message)); process.exitCode = 1; void discordRuntime.stop(); });
+  server.listen(ENV.PORT, '0.0.0.0', () => {
+    console.log(`Web server started on port ${ENV.PORT}`);
+    // HTTP diagnostics remain available while the Gateway connects/reconnects.
+    void discordRuntime.start().catch(error => console.error(redact(error.message)));
+    void runChecks().catch(error => console.error(redact(error.message)));
+    pollingTimer = setInterval(() => { void runChecks().catch(error => console.error(redact(error.message))); }, CFG.CHECK_MS);
+  });
+  let stopping = false;
+  async function shutdown() {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(pollingTimer);
+    server.close();
+    await discordRuntime.stop();
+    await stateStore.pending;
+    process.exit(0);
+  }
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+}
+
+main().catch(error => {
+  console.error(`Startup failed: ${redact(error?.message || error)}`);
+  process.exitCode = 1;
 });
